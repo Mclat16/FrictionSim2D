@@ -6,7 +6,7 @@ This guide is aligned with the current repository (`pyproject.toml`) and CLI beh
 
 - Python 3.9+
 - LAMMPS executable available in your environment
-- Atomsk executable available in your environment
+- Atomsk executable available in your environment (optional)
 
 Optional features require extra dependencies:
 
@@ -44,6 +44,11 @@ Then verify external binaries used by workflows:
 
 ```bash
 lmp -h
+```
+
+If you use Atomsk-based geometry operations, also verify:
+
+```bash
 atomsk --version
 ```
 
@@ -83,9 +88,13 @@ FrictionSim2D api serve --host 0.0.0.0 --port 8000
 - Check that your environment is active.
 - Re-run `pip install -e .` from repository root.
 
-`lmp` or `atomsk` missing
+`lmp` missing
 
-- Install these tools in the same environment used to run FrictionSim2D.
+- Install LAMMPS in the same environment used to run FrictionSim2D.
+
+`atomsk` missing
+
+- Atomsk is optional. Install it only if you plan to use Atomsk-based operations.
 
 AiiDA commands abort immediately
 

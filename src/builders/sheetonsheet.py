@@ -12,7 +12,7 @@ Constraint modes control interlayer bonding and ghost interactions:
     - com_spring: COM spring between top 2 layers, ghost LJ for non-adjacent
         layers, no constraints on bottom layers.
     - none: No bonds or springs, real LJ for all layer pairs.
-""" 
+"""
 
 import logging
 from pathlib import Path
@@ -107,7 +107,7 @@ class SheetOnSheetSimulation(SimulationBase):
         logger.info("Building %d-layer sheet stack...", n_layers)
         stacking_type = getattr(self.config.sheet, 'stack_type', 'AB')
         sheet_path, dims, lat_c = components.build_sheet(
-            self.config.sheet, self.atomsk, build_dir,
+            self.config.sheet, build_dir,
             stack_if_multi=True, settings=self.config.settings,
             n_layers_override=n_layers, use_pair_bonding=use_pair_bonding,
             stacking_type=stacking_type

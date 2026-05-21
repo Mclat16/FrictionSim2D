@@ -49,7 +49,7 @@ class SimulationBase(ABC):
     Attributes:
         config: The validated configuration object for the simulation.
         output_dir: The root directory for simulation output.
-        atomsk: Interface for geometry manipulation.
+        atomsk: Optional Atomsk interface for geometry manipulation.
         jinja_env: Template engine environment.
     """
 
@@ -68,7 +68,14 @@ class SimulationBase(ABC):
         self.output_dir = Path(output_dir).resolve()
         self.config_path = Path(config_path).resolve() if config_path else None
         self.base_output_dir: Optional[Path] = None
-        self.atomsk = AtomskWrapper()
+        try:
+            self.atomsk: Optional[AtomskWrapper] = AtomskWrapper()
+        except RuntimeError:
+            self.atomsk = None
+            logger.info(
+                "Atomsk not found. Continuing with native geometry pipeline; "
+                "Atomsk-only operations will be unavailable."
+            )
 
         self.jinja_env = Environment(
             loader=PackageLoader('src.templates'),

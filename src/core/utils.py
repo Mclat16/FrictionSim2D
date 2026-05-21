@@ -343,6 +343,68 @@ def read_config(filepath: Union[str, Path]) -> Dict[str, Dict[str, Any]]:
                 params[section][key] = value
     return params
 
+
+def _is_int_token(value: str) -> bool:
+    """Return True if token represents an integer (optional sign allowed)."""
+    return bool(re.fullmatch(r'[+-]?\d+', value))
+
+
+def _is_lammps_section_header(line: str) -> bool:
+    """Detect a section header line while scanning an Atoms block."""
+    if not line:
+        return False
+    first = line[0]
+    if first == '#':
+        return False
+    if first.isdigit() or first in ['-', '+', '.']:
+        return False
+    return True
+
+
+def _convert_atoms_style(
+    filepath: Union[str, Path],
+    source_style: str,
+    target_style: str,
+    transform_atom_fields
+) -> None:
+    """Convert Atoms section style in-place using a per-line transformation callback."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    in_atoms_section = False
+    converted_lines = []
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+
+        if stripped == f"{LAMPS_SECTION_ATOMS} {source_style}":
+            converted_lines.append(f"{LAMPS_SECTION_ATOMS} {target_style}\n")
+            in_atoms_section = True
+            continue
+
+        if in_atoms_section:
+            if not stripped:
+                converted_lines.append(raw_line)
+                continue
+
+            if _is_lammps_section_header(stripped):
+                in_atoms_section = False
+                converted_lines.append(raw_line)
+                continue
+
+            parts = stripped.split()
+            transformed = transform_atom_fields(parts)
+            if transformed is None:
+                converted_lines.append(raw_line)
+            else:
+                converted_lines.append(f"{transformed}\n")
+            continue
+
+        converted_lines.append(raw_line)
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.writelines(converted_lines)
+
 def atomic2charge(filepath: Union[str, Path]) -> None:
     """Convert a LAMMPS data file from atomic to charge format in-place.
 
@@ -353,36 +415,30 @@ def atomic2charge(filepath: Union[str, Path]) -> None:
     Args:
         filepath: Path to the LAMMPS data file to be modified.
     """
-    with open(filepath, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+    def _to_charge(parts: List[str]) -> Optional[str]:
+        if len(parts) < 5 or not _is_int_token(parts[0]) or not _is_int_token(parts[1]):
+            return None
+        return ' '.join([parts[0], parts[1], '0.0'] + parts[2:])
 
-    atoms_section = False
-    modified_lines = []
+    _convert_atoms_style(filepath, LAMMPS_STYLE_ATOMIC, LAMMPS_STYLE_CHARGE, _to_charge)
 
-    for line in lines:
-        line = line.strip()
 
-        if line.startswith(LAMMPS_SECTION_VELOCITIES):
-            break
+def charge2atom(filepath: Union[str, Path]) -> None:
+    """Convert a LAMMPS data file from charge to atomic format in-place.
 
-        if line == f"{LAMPS_SECTION_ATOMS} {LAMMPS_STYLE_ATOMIC}":
-            modified_lines.append(f"{LAMPS_SECTION_ATOMS} {LAMMPS_STYLE_CHARGE}")
-            atoms_section = True
-            continue
+    Modifies the "Atoms" section by switching header style from charge to
+    atomic and removing the charge column. If the file is not in charge style,
+    this function is a no-op.
 
-        if atoms_section and line:
-            parts = line.split()
-            if len(parts) >= 5 and all(c in '0123456789.-+eE' for c in parts[0]):
-                atom_id = parts[0]
-                atom_type = parts[1]
-                x, y, z = parts[2:5]
-                modified_lines.append(f"{atom_id} {atom_type} 0.0 {x} {y} {z}")
-                continue
+    Args:
+        filepath: Path to the LAMMPS data file to be modified.
+    """
+    def _to_atomic(parts: List[str]) -> Optional[str]:
+        if len(parts) < 6 or not _is_int_token(parts[0]) or not _is_int_token(parts[1]):
+            return None
+        return ' '.join([parts[0], parts[1]] + parts[3:])
 
-        modified_lines.append(line)
-
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("\n".join(modified_lines) + "\n")
+    _convert_atoms_style(filepath, LAMMPS_STYLE_CHARGE, LAMMPS_STYLE_ATOMIC, _to_atomic)
 
 
 def atomic2molecular(filepath: Union[str, Path]) -> None:
@@ -395,64 +451,111 @@ def atomic2molecular(filepath: Union[str, Path]) -> None:
     Args:
         filepath: Path to the LAMMPS data file to be modified.
     """
-    with open(filepath, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+    def _to_molecular(parts: List[str]) -> Optional[str]:
+        if len(parts) < 5 or not _is_int_token(parts[0]) or not _is_int_token(parts[1]):
+            return None
+        # Preserve image flags (nx, ny, nz) and any trailing atom metadata.
+        return ' '.join([parts[0], '0', parts[1]] + parts[2:])
 
-    atoms_section = False
-    modified_lines = []
+    _convert_atoms_style(filepath, LAMMPS_STYLE_ATOMIC, LAMMPS_STYLE_MOLECULAR, _to_molecular)
 
-    for line in lines:
-        line = line.strip()
 
-        if line.startswith(LAMMPS_SECTION_VELOCITIES):
-            break
+def get_potential_element_order(
+    potential_filepath: Union[str, Path],
+    pot_type: str,
+    cif_elements: List[str]
+) -> Tuple[List[str], Dict[str, int]]:
+    """Parse potential file to determine element order and validate CIF compatibility.
 
-        if line == f"{LAMPS_SECTION_ATOMS} {LAMMPS_STYLE_ATOMIC}":
-            modified_lines.append(f"{LAMPS_SECTION_ATOMS} {LAMMPS_STYLE_MOLECULAR}")
-            atoms_section = True
-            continue
+    Uses both CIF and potential metadata to build a robust, validated mapping.
+    Fails early if CIF and potential have mismatched elements.
 
-        if atoms_section and line:
-            parts = line.split()
-            if len(parts) >= 5 and all(c in '0123456789.-+eE' for c in parts[0]):
-                atom_id = parts[0]
-                atom_type = parts[1]
-                x, y, z = parts[2:5]
-                # Preserve nx, ny, nz if present to avoid unwrapped-topology warnings.
-                image_flags = ""
-                if len(parts) >= 8:
-                    image_flags = f" {parts[5]} {parts[6]} {parts[7]}"
-                new_line = f"{atom_id} 0 {atom_type} {x} {y} {z}{image_flags}"
-                modified_lines.append(new_line)
+    Args:
+        potential_filepath: Path to potential file.
+        pot_type: Potential type (sw, tersoff, rebo, reaxff, etc.).
+        cif_elements: Elements from CIF file (source of truth for identity).
+
+    Returns:
+        Tuple of (pot_element_order, pot_element_counts) where:
+        - pot_element_order: Ordered list of elements expected by potential
+        - pot_element_counts: {element: num_types} for each element
+
+    Raises:
+        ValueError: If CIF elements don't match potential elements or validation fails.
+    """
+    pot_lower = pot_type.lower()
+    single_type_pots = {'reaxff', 'reax/c', 'rebo', 'rebomos', 'airebo', 'meam'}
+    single_type_exts = ('.rebo', '.rebomos', '.airebo', '.meam', '.reaxff')
+
+    if pot_lower in single_type_pots or str(potential_filepath).lower().endswith(single_type_exts):
+        pot_element_counts = {el: 1 for el in cif_elements}
+        return cif_elements, pot_element_counts
+
+    pattern = re.compile(r'([A-Za-z]+)(\d*)')
+    pot_element_counts = {el: 0 for el in cif_elements}
+    cif_set = set(cif_elements)
+
+    with open(potential_filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith('#') or not stripped:
                 continue
 
-        modified_lines.append(line)
+            parts = stripped.split()
+            for element_token in parts[:3]:
+                match = pattern.match(element_token)
+                if match:
+                    element_name = match.group(1)
+                    element_number = int(match.group(2)) if match.group(2) else 1
 
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("\n".join(modified_lines) + "\n")
+                    if element_name not in cif_set:
+                        raise ValueError(
+                            f"Potential contains element '{element_name}' not in CIF (CIF has {cif_elements})"
+                        )
+
+                    pot_element_counts[element_name] = max(
+                        pot_element_counts[element_name], element_number
+                    )
+
+    missing = [el for el, count in pot_element_counts.items() if count == 0]
+    if missing:
+        raise ValueError(
+            f"CIF has element(s) {missing} but potential has no definition for them."
+        )
+
+    pot_element_order = list(cif_elements)
+    return pot_element_order, pot_element_counts
 
 
-def renumber_atom_types(filename: Union[str, Path], pot: Optional[List[str]] = None) -> None:
+def renumber_atom_types(
+    filename: Union[str, Path],
+    pot: Optional[List[str]] = None,
+    type_to_element_map: Optional[Dict[int, str]] = None
+) -> None:
     """Renumber atom types in a LAMMPS data file to sequential order.
 
     Modifies a LAMMPS data file in-place to ensure atom types are numbered
     sequentially from 1. If a potential `pot` is provided, renumbers the types
     to match the order of elements in that list.
-    
+        
     Algorithm:
     1. Parse the Masses section to build a map of type_id -> (element_name, mass).
-    2. Scan Atoms section and renumber each atom's type field to sequential order.
+    2. Scan Atoms section and renumber only atom types (preserving atom IDs).
     3. If pot list is provided, reorder atoms by element to match pot order.
     4. Rebuild Masses section with new sequential type IDs.
 
     Args:
         filename: Path to the LAMMPS data file to be modified.
         pot: List of element symbols in the desired order for renumbering.
+        type_to_element_map: Optional explicit mapping of old type ID -> element
+            symbol. If provided, this is used instead of relying on ``# element``
+            comments in the Masses section.
     """
     with open(filename, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
     # PASS 1: Parse Masses section to extract type ID -> (element_name, mass) mapping
+    explicit_map = {int(k): v for k, v in (type_to_element_map or {}).items()}
     masses_section = False
     atom_types = {}  # maps old type_id -> (element_name, mass)
 
@@ -471,27 +574,33 @@ def renumber_atom_types(filename: Union[str, Path], pot: Optional[List[str]] = N
 
             atom_type_id = int(parts[0])
             mass = float(parts[1])
-            # Extract element name from comment if present (e.g., "1 12.011  # C")
-            if '#' in line:
+            # Clear original mass lines so PASS 4 can rewrite a clean Masses block.
+            lines[i] = ''
+
+            # Use explicit mapping first, then comment fallback.
+            if atom_type_id in explicit_map:
+                atom_type_name = explicit_map[atom_type_id]
+            elif '#' in line:
+                # Extract element name from comment if present (e.g., "1 12.011  # C")
                 atom_type_name = line.split('#')[-1].strip()
-                lines[i] = ''
             else:
                 atom_type_name = f'Unknown_{atom_type_id}'
             atom_types[atom_type_id] = (atom_type_name, mass)
 
-    # PASS 2: Scan Atoms section and build mapping of new type IDs -> atom lines
-    # If pot is provided, this also reorders by element.
+    # PASS 2: Scan Atoms section and build mapping of new type IDs -> atom lines.
+    # When pot is provided, each atom gets a UNIQUE intermediate type via interleaving
+    # (type_offset = len(atom_types)), so that PASS 3 can reassign to sequential grouped types.
     modified_lines = set()  # Track which line indices have been processed
-    mod_lines = {}  # Maps new type_id -> reformatted atom line string
+    mod_lines = {}  # Maps new type_id -> reformatted atom line string (one entry per atom)
     elem = {}  # Maps new type_id -> (element_name, mass)
-    type_offset = len(atom_types) if pot is not None else 1  # Stride for type numbering
+    type_offset = len(atom_types) if pot is not None else 1
     current_type = 1
 
     # For each old type ID, find atoms with that type and assign new type IDs
     for old_type_id in range(1, len(atom_types) + 1):
         atoms_section = False
         if pot is not None:
-            # When reordering by element list, use pot index as new type
+            # Interleave: start each element group at its old_type_id offset
             current_type = old_type_id
 
         # Scan atoms section to find all atoms with old_type_id
@@ -508,29 +617,29 @@ def renumber_atom_types(filename: Union[str, Path], pot: Optional[List[str]] = N
 
                 # Check if this atom has the current old_type_id
                 if len(parts) > 1 and parts[1] == str(old_type_id):
-                    # Renumber: set both atom_id and atom_type to new type
-                    parts[1] = parts[0] = str(current_type)
+                    # Renumber: update ONLY atom type (parts[1]), preserve atom ID (parts[0])
+                    parts[1] = str(current_type)
                     lines[line_idx] = ''  # Clear old line
                     mod_lines[current_type] = '  '.join(parts) + '\n'
                     modified_lines.add(line_idx)
                     elem[current_type] = atom_types[old_type_id]
                     current_type += type_offset
 
-    # PASS 3: If pot list is provided, reorder atoms to match pot element order
+    # PASS 3: If pot list is provided, reorder atoms to match pot element order.
+    # Iterates over sorted intermediate type keys and reassigns to sequential grouped types.
     if pot is not None:
         atom_idx = 1
-        atom_lines = {}  # Final mapping of new type_id -> atom line
-        elem_pot = {}  # Element re-ordering map
+        atom_lines = {}  # Final mapping: sequential type_id -> atom line
+        elem_pot = {}  # Element mapping for new sequential type IDs
 
-        # For each element in the pot list, find corresponding atoms and renumber sequentially
+        # For each element in the pot list, find corresponding atoms and reassign sequentially.
+        # Iterate sorted intermediate type keys directly (NOT a range) to handle cases where
+        # atom counts per element differ (e.g. 1 Mo + 2 S produces keys {1, 2, 4}).
         for element in pot:
-            # Search mod_lines for atoms matching current element
-            for line_num in range(1, len(mod_lines) + 1):
-                if line_num not in mod_lines:
-                    continue
+            for line_num in sorted(mod_lines.keys()):
                 stripped_line = mod_lines[line_num].strip()
                 parts = stripped_line.split()
-                # Match element name (case-insensitive)
+                # Match element name using intermediate type key (case-insensitive)
                 if elem[int(parts[1])][0].upper() == element.upper():
                     elem_pot[atom_idx] = elem[int(parts[1])]
                     parts[1] = str(atom_idx)
@@ -557,9 +666,25 @@ def renumber_atom_types(filename: Union[str, Path], pot: Optional[List[str]] = N
                 lines[i] += f"{atom_type_id} {elem[atom_type_id][1]}  #{elem[atom_type_id][0]}\n"
             break
 
+    # Write a clean file: keep header + Masses + Atoms header, then atom lines.
+    # This avoids malformed layout when the input also contains trailing sections
+    # (e.g. Velocities) and the original atom lines were cleared in-place.
+    atoms_header_idx = next(
+        (i for i, line in enumerate(lines) if LAMPS_SECTION_ATOMS in line),
+        None
+    )
+    if atoms_header_idx is None:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        with open(filename, 'a', encoding='utf-8') as f:
+            for line in mod_lines.values():
+                f.write(line)
+        return
+
     with open(filename, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
-    with open(filename, 'a', encoding='utf-8') as f:
+        for line in lines[:atoms_header_idx + 1]:
+            f.write(line)
+        f.write('\n')
         for line in mod_lines.values():
             f.write(line)
 

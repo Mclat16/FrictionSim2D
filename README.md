@@ -11,7 +11,7 @@ FrictionSim2D is not yet published on conda-forge. The supported installation pa
 
 - Python 3.9+
 - LAMMPS available in your environment
-- Atomsk available in your environment
+- Atomsk available in your environment (optional, only for Atomsk-specific workflows)
 
 ### Create an environment
 
@@ -53,6 +53,11 @@ pip install -e .[all]
 FrictionSim2D --help
 FrictionSim2D --version
 lmp -h
+```
+
+If you plan to use Atomsk-based geometry operations, also verify:
+
+```bash
 atomsk --version
 ```
 

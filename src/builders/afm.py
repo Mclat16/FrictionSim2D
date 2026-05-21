@@ -62,7 +62,7 @@ class AFMSimulation(SimulationBase):
 
             stacking_type = getattr(self.config.sheet, 'stack_type', 'AB')
             sheet_path, sheet_dims, lat_c = components.build_sheet(
-                self.config.sheet, self.atomsk, build_dir,
+                self.config.sheet, build_dir,
                 stack_if_multi=True, settings=self.config.settings,
                     n_layers_override=n_layers,
                     stacking_type=stacking_type
@@ -110,12 +110,12 @@ class AFMSimulation(SimulationBase):
             Tuple of (tip_path, tip_radius, sub_path).
         """
         tip_path, tip_radius = components.build_tip(
-            self.config.tip, self.atomsk, build_dir, self.config.settings
+            self.config.tip, build_dir, self.config.settings
         )
         logger.info("Built tip: %s", tip_path.name)
 
         sub_path = components.build_substrate(
-            self.config.sub, self.atomsk, build_dir, self.sheet_dims,
+            self.config.sub, build_dir, self.sheet_dims,
             settings=self.config.settings
         )
         logger.info("Built substrate: %s", sub_path.name)

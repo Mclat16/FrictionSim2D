@@ -6,9 +6,6 @@ LAMMPS file reading, and configuration file parsing.
 import pytest
 import tempfile
 from pathlib import Path
-import json
-import configparser
-from io import StringIO
 
 from src.core.utils import (
     _is_float,
@@ -16,8 +13,10 @@ from src.core.utils import (
     get_model_dimensions,
     read_config,
     atomic2charge,
+    charge2atom,
     atomic2molecular,
     renumber_atom_types,
+    get_potential_element_order,
 )
 
 
@@ -99,8 +98,8 @@ class TestLjParams:
     
     def test_lj_params_mixing_rule(self):
         """Test that mixing rule is applied correctly (geometric mean for epsilon)."""
-        eps_c_h, sig_c_h = lj_params('C', 'H')
-        eps_c_c, sig_c_c = lj_params('C', 'C')
+        eps_c_h, _ = lj_params('C', 'H')
+        eps_c_c, _ = lj_params('C', 'C')
         # epsilon should be between the two pure element values
         assert eps_c_c >= eps_c_h or eps_c_h >= eps_c_c
 
@@ -253,10 +252,11 @@ Velocities
     def test_atomic_to_charge_conversion(self, lammps_atomic_file):
         """Test conversion from atomic to charge format."""
         atomic2charge(lammps_atomic_file)
-        with open(lammps_atomic_file, 'r') as f:
+        with open(lammps_atomic_file, 'r', encoding='utf-8') as f:
             content = f.read()
         assert "Atoms # charge" in content
         assert "1 1 0.0 0.0 0.0 0.0" in content or "1 1 0.0 0.0 0.0" in content
+        assert "Velocities" in content
         lammps_atomic_file.unlink()
 
 
@@ -284,11 +284,46 @@ Velocities
     def test_atomic_to_molecular_conversion(self, lammps_atomic_file):
         """Test conversion from atomic to molecular format."""
         atomic2molecular(lammps_atomic_file)
-        with open(lammps_atomic_file, 'r') as f:
+        with open(lammps_atomic_file, 'r', encoding='utf-8') as f:
             content = f.read()
         assert "Atoms # molecular" in content
         assert "0 1" in content  # Molecule ID 0
-        lammps_atomic_file.unlink()
+        assert "Velocities" in content
+
+
+class TestChargeToAtomic:
+    """Test cases for charge2atom conversion."""
+
+    @pytest.fixture
+    def lammps_charge_file(self):
+        """Create a LAMMPS file in charge format."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.lmp', delete=False) as f:
+            f.write("""LAMMPS data file
+ 2 atoms
+
+Atoms # charge
+
+1 1 -0.1 0.0 0.0 0.0
+2 2 0.2 1.0 1.0 1.0
+
+Velocities
+
+1 0.0 0.0 0.0
+""")
+            return Path(f.name)
+
+    def test_charge_to_atomic_conversion(self, lammps_charge_file):
+        """Test conversion from charge to atomic format."""
+        charge2atom(lammps_charge_file)
+        with open(lammps_charge_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        assert "Atoms # atomic" in content
+        assert "1 1 0.0 0.0 0.0" in content
+        assert "2 2 1.0 1.0 1.0" in content
+        assert "Velocities" in content
+
+        lammps_charge_file.unlink()
 
     def test_atomic_to_molecular_preserves_image_flags(self):
         """Image flags should be preserved when converting style."""
@@ -313,6 +348,137 @@ Velocities
         assert "Atoms # molecular" in content
         assert "1 0 1 0.0 0.0 0.0 1 -1 2" in content
         path.unlink()
+
+
+class TestRobustRenumbering:
+    """Test cases for robust atom type renumbering with explicit CIF-potential mapping."""
+
+    def test_renumber_preserves_atom_ids(self, tmp_path: Path) -> None:
+        """Renumbering should only change atom types, never atom IDs."""
+        lmp_file = tmp_path / "test.lmp"
+        lmp_file.write_text(
+            """LAMMPS data file
+ 4 atoms
+ 2 atom types
+
+Masses
+
+1 12.0 # C
+2 14.0 # N
+
+Atoms # atomic
+
+1 1 0.0 0.0 0.0
+2 2 1.0 1.0 1.0
+3 1 2.0 2.0 2.0
+4 2 3.0 3.0 3.0
+""",
+            encoding="utf-8",
+        )
+
+        renumber_atom_types(lmp_file, pot=["N", "C"])
+        content = lmp_file.read_text(encoding="utf-8")
+
+        # After renumbering with pot=["N", "C"] and type_offset=2 (interleaving):
+        # N atoms (original type 2) → intermediate types 2, 4 → final sequential types 1, 2
+        # C atoms (original type 1) → intermediate types 1, 3 → final sequential types 3, 4
+        # Each atom ID must be preserved; atom IDs must NOT be renumbered
+        lines = content.strip().split("\n")
+        atoms_idx = next((i for i, l in enumerate(lines) if "Atoms" in l), -1)
+        assert atoms_idx >= 0, "Atoms section not found"
+
+        atom_data = {
+            int(p.split()[0]): int(p.split()[1])
+            for p in (l.strip() for l in lines[atoms_idx + 2:] if l.strip())
+            if len(p.split()) >= 2
+        }
+
+        # All original atom IDs must still exist in the file
+        assert set(atom_data.keys()) == {1, 2, 3, 4}, f"Atom IDs changed: {set(atom_data.keys())}"
+        # N atoms (IDs 2, 4) → sequential types 1, 2 (N comes first in pot)
+        assert atom_data[2] in {1, 2}, f"N atom 2 got unexpected type {atom_data[2]}"
+        assert atom_data[4] in {1, 2}, f"N atom 4 got unexpected type {atom_data[4]}"
+        # C atoms (IDs 1, 3) → sequential types 3, 4 (C comes after N in pot)
+        assert atom_data[1] in {3, 4}, f"C atom 1 got unexpected type {atom_data[1]}"
+        assert atom_data[3] in {3, 4}, f"C atom 3 got unexpected type {atom_data[3]}"
+        # All N types must differ from all C types
+        n_types = {atom_data[2], atom_data[4]}
+        c_types = {atom_data[1], atom_data[3]}
+        assert n_types.isdisjoint(c_types), f"N and C types overlap: {n_types} vs {c_types}"
+
+    def test_get_potential_element_order_single_type(self, tmp_path: Path) -> None:
+        """Single-type potentials should return one type per element."""
+        pot_file = tmp_path / "test.rebo"
+        pot_file.write_text(
+            "# Test REBO file\nC H# dummy",
+            encoding="utf-8",
+        )
+
+        order, counts = get_potential_element_order(
+            pot_file, "rebo", ["C", "H"]
+        )
+
+        assert order == ["C", "H"]
+        assert counts == {"C": 1, "H": 1}
+
+    def test_get_potential_element_order_multi_type(self, tmp_path: Path) -> None:
+        """Multi-type potentials should detect type counts from element tokens."""
+        pot_file = tmp_path / "test.sw"
+        pot_file.write_text(
+            """# Stillinger-Weber potential
+Mo1 Mo2 S1
+Mo1 Mo1 12.0
+S1 S1 15.0
+""",
+            encoding="utf-8",
+        )
+
+        order, counts = get_potential_element_order(
+            pot_file, "sw", ["Mo", "S"]
+        )
+
+        assert order == ["Mo", "S"]
+        assert counts["Mo"] == 2
+        assert counts["S"] == 1
+
+    def test_get_potential_element_order_mismatched_elements(self, tmp_path: Path) -> None:
+        """Mismatched CIF and potential elements should raise ValueError."""
+        pot_file = tmp_path / "test.sw"
+        pot_file.write_text(
+            """# Potential with Au and Ag
+Au1 Au2 Ag1
+Au1 Au1 12.0
+Ag1 Ag1 15.0
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Potential contains element.*not in CIF",
+        ):
+            get_potential_element_order(
+                pot_file, "sw", ["Mo", "S"]
+            )
+
+    def test_get_potential_element_order_missing_cif_element(self, tmp_path: Path) -> None:
+        """CIF element missing from potential should raise ValueError."""
+        pot_file = tmp_path / "test.sw"
+        pot_file.write_text(
+            """# Potential with only Mo
+Mo1 Mo2
+Mo1 Mo1 12.0
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="CIF has element.*but potential has no definition",
+        ):
+            get_potential_element_order(
+                pot_file, "sw", ["Mo", "S"]
+            )
 
 
 class TestEdgeCases:

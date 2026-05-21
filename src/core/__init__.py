@@ -30,8 +30,10 @@ from .utils import (
     read_config,
     get_model_dimensions,
     get_num_atom_types,
+    charge2atom,
     atomic2molecular,
     renumber_atom_types,
+    get_potential_element_order,
     check_potential_cif_compatibility,
 )
 from .run import (
@@ -62,8 +64,10 @@ __all__ = [
     "read_config",
     "get_model_dimensions",
     "get_num_atom_types",
+    "charge2atom",
     "atomic2molecular",
     "renumber_atom_types",
+    "get_potential_element_order",
     "check_potential_cif_compatibility",
     "expand_config_sweeps",
     "collect_hpc_simulation_paths",

@@ -235,6 +235,13 @@ def generate_hpc_scripts_for_root(simulation_root: Path, settings) -> None:
     """Generate shared HPC scripts for a simulation root directory."""
 
     hpc_config = HPCConfig.from_settings(settings.hpc)
+    # Skip only when required HPC settings were not provided.
+    if not hpc_config.modules:
+        logger.warning(
+            "Skipping HPC script generation: no HPC modules configured in settings.hpc.modules."
+        )
+        return
+
     simulation_paths = collect_hpc_simulation_paths(
         simulation_root,
         lammps_scripts=hpc_config.lammps_scripts,

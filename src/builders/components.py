@@ -28,9 +28,9 @@ from jinja2 import Environment
 from ..core.config import GlobalSettings, SheetConfig, SubstrateConfig, TipConfig, ComponentConfig
 from ..core.potential_manager import PotentialManager
 from ..core.utils import (
-    cifread, count_atomtypes, get_material_path, get_model_dimensions,
+    cifread, get_material_path, get_model_dimensions,
     renumber_atom_types, check_potential_cif_compatibility, get_num_atom_types,
-    atomic2charge, shift_atoms_to_z_zero
+    atomic2charge, charge2atom, shift_atoms_to_z_zero, get_potential_element_order
 )
 from ..interfaces.atomsk import AtomskWrapper
 from ..interfaces.jinja import PackageLoader
@@ -43,6 +43,317 @@ def _create_lammps_instance():
     from lammps import lammps  # pylint: disable=import-outside-toplevel
 
     return lammps(cmdargs=["-log", "none", "-screen", "none", "-nocite"])
+
+
+def _write_cif_as_lammps_atomic(
+    cif_path: Path,
+    output_path: Path,
+    specorder: Optional[List[str]] = None
+) -> None:
+    """Write a CIF structure as LAMMPS data in atomic style.
+
+    ASE's LAMMPS writer omits the Masses section, which is required by
+    renumber_atom_types for element identification.  This function injects
+    the missing Masses block after the atom-type count header.
+
+    Args:
+        cif_path: Input CIF path.
+        output_path: Output LAMMPS data path.
+        specorder: Optional element order for deterministic type assignment.
+    """
+    from ase.data import atomic_masses, atomic_numbers  # pylint: disable=import-outside-toplevel
+
+    atoms = ase_io.read(str(cif_path))
+    if isinstance(atoms, list):
+        atoms = atoms[0]
+
+    if output_path.exists():
+        output_path.unlink()
+
+    write_kwargs = {
+        'filename': str(output_path),
+        'images': atoms,
+        'format': 'lammps-data',
+        'atom_style': 'atomic'
+    }
+    if specorder:
+        write_kwargs['specorder'] = specorder
+
+    ase_io.write(**write_kwargs)
+
+    # Inject Masses section (ASE omits it); use specorder when available.
+    # Insert just before the Atoms section so box-bounds lines aren't mistaken for masses.
+    elements = specorder if specorder else sorted(set(atoms.get_chemical_symbols()))
+    masses_block = "Masses\n\n"
+    for idx, element in enumerate(elements, start=1):
+        mass = atomic_masses[atomic_numbers[element]]
+        masses_block += f"{idx} {mass:.6f}  # {element}\n"
+    masses_block += "\n"
+
+    content = output_path.read_text(encoding='utf-8')
+    import re  # pylint: disable=import-outside-toplevel
+    # Insert the Masses block immediately before the "Atoms" section header
+    content = re.sub(
+        r'(Atoms\s)',
+        masses_block + r'\1',
+        content,
+        count=1
+    )
+    output_path.write_text(content, encoding='utf-8')
+
+
+def _orthogonalize_lammps_data(input_path: Path, output_path: Path) -> None:
+    """Orthogonalize a LAMMPS data file.
+
+    For orthogonal (no-tilt) boxes, uses LAMMPS ``change_box all ortho``.
+    For triclinic (tilted) boxes, uses ASE ``make_supercell`` to build the
+    minimum orthogonal supercell, then writes the result as LAMMPS data and
+    re-injects the Masses section preserved from the original file.
+
+    Args:
+        input_path: Input LAMMPS data path.
+        output_path: Orthogonalized output path.
+    """
+    import re as _re  # pylint: disable=import-outside-toplevel
+    from ase.build import make_supercell as _make_supercell  # pylint: disable=import-outside-toplevel
+
+    if output_path.exists():
+        output_path.unlink()
+
+    # Check whether the box is already orthogonal (no xy xz yz line with non-zero values)
+    content = input_path.read_text(encoding='utf-8')
+    tilt_match = _re.search(
+        r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+'
+        r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+'
+        r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+xy xz yz',
+        content
+    )
+    has_tilt = tilt_match is not None and any(
+        abs(float(tilt_match.group(i))) > 1e-10 for i in (1, 2, 3)
+    )
+
+    if not has_tilt:
+        # Orthogonal box: LAMMPS change_box approach
+        lmp = _create_lammps_instance()
+        try:
+            lmp.command("clear")
+            lmp.command("units metal")
+            lmp.command("atom_style atomic")
+            lmp.command(f'read_data "{input_path}"')
+            lmp.command("change_box all ortho")
+            lmp.command(f'write_data "{output_path}"')
+        finally:
+            lmp.close()
+        return
+
+    # Triclinic box: use ASE to build a minimum orthogonal supercell.
+    # Read the structure; preserve specorder from the Masses section.
+    masses_lines = []
+    in_masses = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped == 'Masses':
+            in_masses = True
+            continue
+        if in_masses:
+            if stripped == '' or stripped.startswith('Atoms'):
+                if stripped.startswith('Atoms'):
+                    in_masses = False
+                continue
+            parts = stripped.split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                masses_lines.append(stripped)
+
+    specorder = None
+    if masses_lines:
+        specorder = []
+        for mline in masses_lines:
+            parts = mline.split()
+            if '#' in mline:
+                specorder.append(mline.split('#')[-1].strip())
+
+    atoms = ase_io.read(str(input_path), format='lammps-data',
+                        atom_style='atomic', units='metal',
+                        Z_of_type={i + 1: _element_z(el)
+                                   for i, el in enumerate(specorder or [])})
+    if isinstance(atoms, list):
+        atoms = atoms[0]
+
+    # Build a minimum orthogonal (no-tilt) supercell.
+    # For hexagonal cells, [[1,0,0],[1,2,0],[0,0,1]] gives an orthorhombic 2× cell.
+    cell = atoms.get_cell()
+    transform_matrix = _find_ortho_transform(cell)
+    ortho_atoms = _make_supercell(atoms, transform_matrix)
+
+    write_kwargs: dict = {'filename': str(output_path), 'images': ortho_atoms,
+                          'format': 'lammps-data', 'atom_style': 'atomic'}
+    if specorder:
+        write_kwargs['specorder'] = specorder
+    ase_io.write(**write_kwargs)
+
+    # Re-inject Masses section (ASE omits it)
+    if specorder:
+        from ase.data import atomic_masses as _am, atomic_numbers as _an  # pylint: disable=import-outside-toplevel
+        masses_block = "Masses\n\n"
+        for idx, element in enumerate(specorder, start=1):
+            mass = _am[_an[element]]
+            masses_block += f"{idx} {mass:.6f}  # {element}\n"
+        masses_block += "\n"
+        out_content = output_path.read_text(encoding='utf-8')
+        out_content = _re.sub(r'(Atoms\s)', masses_block + r'\1', out_content, count=1)
+        output_path.write_text(out_content, encoding='utf-8')
+
+
+def _element_z(symbol: str) -> int:
+    """Return atomic number for element symbol."""
+    from ase.data import atomic_numbers  # pylint: disable=import-outside-toplevel
+    return atomic_numbers.get(symbol, 1)
+
+
+def _find_ortho_transform(cell) -> "np.ndarray":
+    """Find a transformation matrix P such that P @ cell is (nearly) orthogonal.
+
+    For hexagonal cells, the canonical 2× transformation [[1,0,0],[1,2,0],[0,0,1]]
+    produces an orthorhombic cell.  For cells already orthogonal, returns the
+    identity matrix.
+
+    Args:
+        cell: ASE Cell or 3×3 array of cell vectors (rows).
+
+    Returns:
+        3×3 integer numpy array P.
+    """
+    _np = np
+
+    c = _np.array(cell)
+    a1, a2 = c[0], c[1]
+
+    # If already orthogonal, return identity
+    if abs(_np.dot(a1, a2)) < 1e-6 * _np.linalg.norm(a1) * _np.linalg.norm(a2):
+        return _np.eye(3, dtype=int)
+
+    # Search for n1, n2 integers (smallest |det|) such that n1*a1 + n2*a2 is along y.
+    best_transform = None
+    best_det = None
+    search_range = range(-6, 7)
+    for n1 in search_range:
+        for n2 in search_range:
+            if n1 == 0 and n2 == 0:
+                continue
+            trial = n1 * a1 + n2 * a2
+            if abs(trial[0]) < 1e-6 and abs(trial[1]) > 1e-3:
+                if best_det is None or abs(n2) < best_det:
+                    best_det = abs(n2)
+                    best_transform = _np.array([[1, 0, 0], [n1, n2, 0], [0, 0, 1]], dtype=int)
+
+    if best_transform is not None:
+        return best_transform
+
+    # Fallback: identity (leave as-is)
+    return _np.eye(3, dtype=int)
+
+
+
+def _duplicate_lammps_data(
+    input_path: Path,
+    output_path: Path,
+    nx: int,
+    ny: int,
+    nz: int
+) -> None:
+    """Duplicate a LAMMPS data file via native LAMMPS replicate.
+
+    This preserves existing atom type IDs, which is required after renumbering.
+
+    Args:
+        input_path: Input LAMMPS data path.
+        output_path: Duplicated output path.
+        nx: X multiplier.
+        ny: Y multiplier.
+        nz: Z multiplier.
+    """
+    if output_path.exists():
+        output_path.unlink()
+
+    lmp = _create_lammps_instance()
+    try:
+        lmp.command("clear")
+        lmp.command("units metal")
+        lmp.command("atom_style atomic")
+        lmp.command(f'read_data "{input_path}"')
+        lmp.command(f"replicate {nx} {ny} {nz}")
+        lmp.command(f'write_data "{output_path}"')
+    finally:
+        lmp.close()
+
+
+def _annotate_masses(path: Path, type_element_map: Dict[int, str]) -> None:
+    """Re-add ``# element`` comments to the Masses section of a LAMMPS data file.
+
+    LAMMPS ``write_data`` strips element comments; this restores them so that
+    ``renumber_atom_types`` can read the element names in its PASS 1.
+
+    Args:
+        path: Path to LAMMPS data file (modified in-place).
+        type_element_map: Mapping of atom-type int -> element symbol.
+    """
+    content = path.read_text(encoding='utf-8')
+    lines = content.splitlines(keepends=True)
+    in_masses = False
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == 'Masses':
+            in_masses = True
+            new_lines.append(line)
+            continue
+        if in_masses:
+            if not stripped:
+                new_lines.append(line)
+                continue
+            if not stripped[0].isdigit():
+                in_masses = False
+                new_lines.append(line)
+                continue
+            parts = stripped.split()
+            type_id = int(parts[0])
+            if type_id in type_element_map and '#' not in stripped:
+                line = line.rstrip('\n').rstrip() + f'  # {type_element_map[type_id]}\n'
+            new_lines.append(line)
+        else:
+            new_lines.append(line)
+    path.write_text(''.join(new_lines), encoding='utf-8')
+
+
+def _strip_velocities(path: Path) -> None:
+    """Remove the Velocities section (and any extra 0 0 0 velocities) from a LAMMPS data file.
+
+    LAMMPS ``write_data`` writes a Velocities section; ``renumber_atom_types``
+    appends atom lines at the end of the file, so the Velocities section must
+    be removed first to keep Atoms as the last section.
+
+    Args:
+        path: Path to LAMMPS data file (modified in-place).
+    """
+    content = path.read_text(encoding='utf-8')
+    lines = content.splitlines(keepends=True)
+    new_lines = []
+    skip = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == 'Velocities':
+            skip = True
+            continue
+        if skip:
+            # Skip until next section header or end of file
+            if stripped and not stripped[0].isdigit() and not stripped[0] == '-':
+                # New section header
+                skip = False
+                new_lines.append(line)
+            # else skip this line (velocity data or blank)
+        else:
+            new_lines.append(line)
+    path.write_text(''.join(new_lines), encoding='utf-8')
 
 def calculate_layer_shifts(
     mat_name: str,
@@ -113,16 +424,25 @@ def create_orthogonal_slab(
         target_x: Target X dimension (Angstroms).
         target_y: Target Y dimension (Angstroms).
         target_z: Target Z dimension (Angstroms), or None for single layer.
-        atomsk: AtomskWrapper instance (created if not provided).
+        atomsk: Retained for API compatibility (unused).
         
     Returns:
         Tuple of (output_path, box_dimensions, duplication_factors).
     """
-    atomsk = atomsk or AtomskWrapper()
+    # Keep `atomsk` in signature for backward compatibility with existing callers.
+    _ = atomsk
     cif_path = Path(cif_path).absolute()
 
+    unit_cell = Path(tempfile.gettempdir()) / f"{cif_path.stem}_{uuid.uuid4().hex[:8]}_unit.lmp"
+    predup_cell = Path(tempfile.gettempdir()) / f"{cif_path.stem}_{uuid.uuid4().hex[:8]}_predup.lmp"
     ortho_cell = Path(tempfile.gettempdir()) / f"{cif_path.stem}_{uuid.uuid4().hex[:8]}_ortho.lmp"
-    atomsk.create_slab(cif_path, ortho_cell, pre_duplicate=[2, 2, 1])
+
+    cif_data = cifread(cif_path)
+    _write_cif_as_lammps_atomic(cif_path, unit_cell, specorder=cif_data['elements'])
+    _duplicate_lammps_data(unit_cell, predup_cell, 2, 2, 1)
+    _orthogonalize_lammps_data(predup_cell, ortho_cell)
+    unit_cell.unlink()
+    predup_cell.unlink()
 
     dims = get_model_dimensions(ortho_cell)
     assert all(dims[k] is not None for k in ['xhi', 'xlo', 'yhi', 'ylo', 'zhi', 'zlo'])
@@ -140,7 +460,7 @@ def create_orthogonal_slab(
     if dup_x == 1 and dup_y == 1 and dup_z == 1:
         shutil.copy(ortho_cell, output_path)
     else:
-        atomsk.duplicate(ortho_cell, output_path, dup_x, dup_y, dup_z)
+        _duplicate_lammps_data(ortho_cell, output_path, dup_x, dup_y, dup_z)
 
     ortho_cell.unlink()
 
@@ -222,12 +542,10 @@ def make_amorphous(
             quench.quench_slab_dims[2], slab_x, slab_y, slab_z
         )
 
-    atomsk = AtomskWrapper()
     base_block = output_dir / f"{mat_name}_crystal_block.lmp"
     create_orthogonal_slab(
         cif_path, base_block,
-        target_x=slab_x, target_y=slab_y, target_z=slab_z,
-        atomsk=atomsk
+        target_x=slab_x, target_y=slab_y, target_z=slab_z
     )
 
     mat_dir = resources.files('src.data.materials')
@@ -322,8 +640,7 @@ def _create_base_slab(
     target_z: float,
     output_path: Path,
     build_dir: Path,
-    settings: GlobalSettings,
-    atomsk: AtomskWrapper
+    settings: GlobalSettings
 ) -> None:
     """Create base slab (amorphous or crystalline).
     
@@ -336,7 +653,6 @@ def _create_base_slab(
         output_path: Output slab file path.
         build_dir: Directory for temporary files.
         settings: Global simulation settings.
-        atomsk: AtomskWrapper instance.
     """
     if config.amorph == 'a':
         pot_path = get_material_path(config.pot_path)
@@ -350,8 +666,7 @@ def _create_base_slab(
     else:
         create_orthogonal_slab(
             cif_path, output_path,
-            target_x=target_x, target_y=target_y, target_z=target_z,
-            atomsk=atomsk
+            target_x=target_x, target_y=target_y, target_z=target_z
         )
 
 def stack_multilayer_sheet(
@@ -424,7 +739,7 @@ def stack_multilayer_sheet(
     layer_shifts = [initial_guess * l for l in range(layers_for_setup)]
 
     per_layer_shifts = calculate_layer_shifts(
-        config.mat, supercell_dims, n_layers=layers_for_setup, 
+        config.mat, supercell_dims, n_layers=layers_for_setup,
         use_pair_bonding=use_pair_bonding, stacking_type=stacking_type
     )
     layer_shifts_x = [shift[0] for shift in per_layer_shifts]
@@ -509,7 +824,6 @@ def stack_multilayer_sheet(
 
 def build_tip(
     config: TipConfig,
-    atomsk: AtomskWrapper,
     build_dir: Path,
     settings: GlobalSettings
 ) -> Tuple[Path, float]:
@@ -517,7 +831,6 @@ def build_tip(
     
     Args:
         config: Tip configuration.
-        atomsk: AtomskWrapper instance.
         build_dir: Output directory.
         settings: Global simulation settings.
         
@@ -535,7 +848,7 @@ def build_tip(
         config, cif_path,
         target_x=box_size, target_y=box_size, target_z=box_size,
         output_path=base_lmp, build_dir=build_dir,
-        settings=settings, atomsk=atomsk
+        settings=settings
     )
 
     if config.amorph != 'a':
@@ -569,7 +882,6 @@ def build_tip(
 
 def build_substrate(
     config: SubstrateConfig,
-    atomsk: AtomskWrapper,
     build_dir: Path,
     box_dims: dict,
     settings: Optional[GlobalSettings] = None
@@ -578,7 +890,6 @@ def build_substrate(
     
     Args:
         config: Substrate configuration.
-        atomsk: AtomskWrapper instance.
         build_dir: Output directory.
         box_dims: Target box dimensions from sheet.
         settings: Global settings (required for amorphous).
@@ -598,7 +909,7 @@ def build_substrate(
         config, cif_path,
         target_x=target_x, target_y=target_y, target_z=target_z,
         output_path=base_lmp, build_dir=build_dir,
-        settings=settings or GlobalSettings(), atomsk=atomsk
+        settings=settings or GlobalSettings()
     )
 
     jinja_env = Environment(
@@ -708,56 +1019,96 @@ def apply_langevin_regions(
 
 def build_monolayer(
     config: SheetConfig,
-    atomsk: AtomskWrapper,
 ) -> Tuple[Path, dict, dict, int, Dict[str, float]]:
     """Build single-layer 2D material sheet.
     
+    Workflow:
+    1. Read CIF structure and validate against potential.
+    2. Write as LAMMPS data with types matching CIF element order.
+    3. Renumber types to match potential file expectations (if multi-type).
+    4. Duplicate and orthogonalize as needed.
+    
     Args:
         config: Sheet configuration.
-        atomsk: AtomskWrapper instance.
         
     Returns:
         Tuple of (path, box_dims, pot_counts, total_types, supercell_dims).
+        
+    Raises:
+        ValueError: If CIF elements do not match potential file expectations.
     """
     cif_path = get_material_path(config.cif_path)
     pot_path = get_material_path(config.pot_path)
     base_path = Path(tempfile.gettempdir()) / f"{config.mat}_1_{uuid.uuid4().hex[:8]}.lmp"
 
     cif_data = cifread(cif_path)
-    pot_counts = count_atomtypes(pot_path, cif_data['elements'])
+    cif_elements = cif_data['elements']
+
+    pot_element_order, pot_element_counts = get_potential_element_order(
+        pot_path, config.pot_type, cif_elements
+    )
+    pot_counts = pot_element_counts
     total_pot_types = sum(pot_counts.values())
 
-    multiplier = 1 if config.pot_type in ['rebo', 'rebomos', 'airebo', 'meam', 'reaxff'] else \
+    logger.debug(
+        "Potential mapping: CIF elements %s -> %d types per element %s",
+        cif_elements, total_pot_types, pot_counts
+    )
+
+    type_multiplier = 1 if config.pot_type in ['rebo', 'rebomos', 'airebo', 'meam', 'reaxff'] else \
         check_potential_cif_compatibility(cif_path, pot_path)
 
     temp_unit_cell = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_unit.lmp"
-    atomsk.convert(cif_path, temp_unit_cell)
+    _write_cif_as_lammps_atomic(cif_path, temp_unit_cell, specorder=cif_elements)
 
-    if any(v != 1 for v in pot_counts.values()) or multiplier != 1:
-        renumber_atom_types(temp_unit_cell)
-
+    # Orthogonalize FIRST (while the file has only the simple CIF element types),
+    # then renumber.  Renumbering after orthogonalization avoids confusion in the
+    # ASE-based tilt removal when types outnumber distinct chemical elements.
     ortho_cell = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_ortho.lmp"
-    atomsk.orthogonalize(temp_unit_cell, ortho_cell)
+    _orthogonalize_lammps_data(temp_unit_cell, ortho_cell)
     temp_unit_cell.unlink()
+
+    if any(v != 1 for v in pot_counts.values()) or type_multiplier != 1:
+        renumber_atom_types(ortho_cell, pot=pot_element_order)
 
     dims = get_model_dimensions(ortho_cell)
 
-    if multiplier != 1:
+    if type_multiplier != 1:
         atoms = ase_io.read(str(ortho_cell), format="lammps-data")
-        natoms = len(atoms)
-        a = 1
-        b = 1
-        if total_pot_types % natoms == 0:
-            for i in range(int(np.sqrt(total_pot_types / natoms)) + 1, 0, -1):
-                if (total_pot_types / natoms) % i == 0:
-                    a = int(i)
-                    b = int(total_pot_types / natoms / i)
+        num_atoms = len(atoms)
+        dup_factor_x = 1
+        dup_factor_y = 1
+        if total_pot_types % num_atoms == 0:
+            for factor_candidate in range(int(np.sqrt(total_pot_types / num_atoms)) + 1, 0, -1):
+                if (total_pot_types / num_atoms) % factor_candidate == 0:
+                    dup_factor_x = int(factor_candidate)
+                    dup_factor_y = int(total_pot_types / num_atoms / factor_candidate)
                     break
+            # Capture type→element mapping BEFORE duplication (# comments still present)
+            type_elem_map: Dict[int, str] = {}
+            for raw_line in ortho_cell.read_text(encoding='utf-8').splitlines():
+                stripped_line = raw_line.strip()
+                if '#' in stripped_line and stripped_line and stripped_line[0].isdigit():
+                    line_parts = stripped_line.split()
+                    try:
+                        type_id = int(line_parts[0])
+                        element_symbol = stripped_line.split('#')[-1].strip().split()[0]
+                        type_elem_map[type_id] = element_symbol
+                    except (ValueError, IndexError):
+                        pass
             dup_ortho = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_dup.lmp"
-            atomsk.duplicate(ortho_cell, dup_ortho, a, b, 1)
+            _duplicate_lammps_data(ortho_cell, dup_ortho, dup_factor_x, dup_factor_y, 1)
             ortho_cell.unlink()
             ortho_cell = dup_ortho
-            renumber_atom_types(ortho_cell, pot=list(pot_counts.keys()))
+            # Strip velocities and renumber using explicit type->element map.
+            # This avoids depending on ``# element`` Masses comments after
+            # LAMMPS write_data strips them.
+            _strip_velocities(ortho_cell)
+            renumber_atom_types(
+                ortho_cell,
+                pot=list(pot_counts.keys()),
+                type_to_element_map=type_elem_map
+            )
             dims = get_model_dimensions(ortho_cell)
 
     dims_calc = get_model_dimensions(ortho_cell)
@@ -776,7 +1127,7 @@ def build_monolayer(
     if dup_x == 1 and dup_y == 1:
         shutil.copy(ortho_cell, base_path)
     else:
-        atomsk.duplicate(ortho_cell, base_path, dup_x, dup_y, 1)
+        _duplicate_lammps_data(ortho_cell, base_path, dup_x, dup_y, 1)
     ortho_cell.unlink()
 
     dims = get_model_dimensions(base_path)
@@ -785,15 +1136,27 @@ def build_monolayer(
     dims = get_model_dimensions(base_path)
 
     if config.pot_type in ['tersoff', 'sw', 'rebo', 'airebo']:
-        atomsk.charge2atom(base_path)
+        charge2atom(base_path)
     elif config.pot_type in ['reaxff', 'reax/c']:
         atomic2charge(base_path)
+
+    observed_types = get_num_atom_types(base_path)
+    if observed_types != total_pot_types:
+        raise ValueError(
+            f"Type count mismatch after build_monolayer: expected {total_pot_types} "
+            f"(from potential) but observed {observed_types} in final structure. "
+            f"Potential mapping: {pot_counts}"
+        )
+
+    logger.info(
+        "Built %s monolayer: %d atom types, mapping %s",
+        config.mat, total_pot_types, pot_counts
+    )
 
     return base_path, dims, pot_counts, total_pot_types, supercell_dims
 
 def build_sheet(
     config: SheetConfig,
-    atomsk: AtomskWrapper,
     build_dir: Path,
     stack_if_multi: bool = False,
     settings: Optional[GlobalSettings] = None,
@@ -805,7 +1168,6 @@ def build_sheet(
     
     Args:
         config: Sheet configuration.
-        atomsk: AtomskWrapper instance.
         build_dir: Output directory.
         stack_if_multi: If True, stack multiple layers.
         settings: Global settings (required for multi-layer).
@@ -817,12 +1179,16 @@ def build_sheet(
         Tuple of (path, box_dims, lat_c).
     """
     base_path, dims, pot_counts, total_pot_types, supercell_dims = build_monolayer(
-        config, atomsk
+        config
     )
 
     n_layers = n_layers_override or (max(config.layers) if config.layers else 1)
     stacked_path = build_dir / f"{config.mat}_{n_layers}.lmp"
     lat_c = config.lat_c
+    if not stack_if_multi:
+        shutil.copy(base_path, stacked_path)
+        return stacked_path, dims, lat_c
+
     if stack_if_multi and n_layers > 1:
         lat_c = stack_multilayer_sheet(
             base_layer_path=base_path,

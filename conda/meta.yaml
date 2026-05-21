@@ -29,7 +29,6 @@ outputs:
       run:
         - python >=3.9
         # --- Scientific Binaries ---
-        - atomsk
         - lammps
         # --- Python Dependencies ---
         - numpy >=1.21
@@ -44,8 +43,25 @@ outputs:
         - src
       commands:
         - FrictionSim2D --help
-        - atomsk --version
         - lmp -h
+
+  # -----------------------------------------------------------------------
+  # Optional Atomsk variant: conda install frictionsim2d-atomsk
+  # Adds Atomsk binary for workflows that need external atomsk operations.
+  # -----------------------------------------------------------------------
+  - name: {{ name|lower }}-atomsk
+    build:
+      noarch: generic
+    requirements:
+      run:
+        - {{ pin_subpackage(name|lower, exact=True) }}
+        - atomsk
+    test:
+      imports:
+        - src
+      commands:
+        - FrictionSim2D --help
+        - atomsk --version
 
   # -----------------------------------------------------------------------
   # AiiDA variant: conda install frictionsim2d-aiida
@@ -139,6 +155,7 @@ outputs:
     requirements:
       run:
         - {{ pin_subpackage(name|lower, exact=True) }}
+        - {{ pin_subpackage(name|lower + '-atomsk', exact=True) }}
         - {{ pin_subpackage(name|lower + '-aiida', exact=True) }}
         - {{ pin_subpackage(name|lower + '-db', exact=True) }}
         - {{ pin_subpackage(name|lower + '-plotting', exact=True) }}

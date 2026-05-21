@@ -191,16 +191,3 @@ class AtomskWrapper:
         else:
             self.run([str(input_file), "-center", "com", str(output_file)])
 
-    def charge2atom(self, input_file: Union[str, Path]) -> None:
-        """Remove charge column from LAMMPS data file (in-place modification).
-
-        Args:
-            input_file: Input file path.
-        """
-        input_path = Path(input_file).resolve()
-        subprocess.run(
-            ["lmp_charge2atom.sh", str(input_path)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
