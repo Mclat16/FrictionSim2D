@@ -110,7 +110,9 @@ class SheetOnSheetSimulation(SimulationBase):
             self.config.sheet, build_dir,
             stack_if_multi=True, settings=self.config.settings,
             n_layers_override=n_layers, use_pair_bonding=use_pair_bonding,
-            stacking_type=stacking_type
+            stacking_type=stacking_type,
+            edge_mode=self.config.settings.geometry.finite_sheet_sheetonsheet_edge_mode,
+            edge_width=self.config.settings.geometry.finite_sheet_edge_width,
         )
         self.structure_paths['sheet'] = sheet_path
 
@@ -170,7 +172,8 @@ class SheetOnSheetSimulation(SimulationBase):
         )
         pm.set_lj_overrides(self.config.lj_override)
 
-        pm.register_component('sheet', self.config.sheet, n_layers=n_layers)
+        sheet_edge_regions = [None, 'edge'] if self.config.settings.geometry.finite_sheet_sheetonsheet_edge_mode != 'none' else None
+        pm.register_component('sheet', self.config.sheet, n_layers=n_layers, regions=sheet_edge_regions)
 
         if self.config.settings.simulation.drive_method == 'virtual_atom':
             pm.register_virtual_atom()

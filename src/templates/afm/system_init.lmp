@@ -14,9 +14,10 @@ create_box      {{ ngroups }} box
 
 read_data       {{ sub_file }} add append group sub
 read_data       {{ tip_file }} add append shift {{ tip_x }} {{ tip_y }} {{ tip_z }} group tip offset {{ sub_natypes }} 0 0 0 0
-read_data       {{ sheet_file }} add append shift 0.0 0.0 {{ sheet_z }} group 2D offset {{ offset_2d }} 0 0 0 0
+read_data       {{ sheet_file }} add append shift {{ sheet_shift_x }} {{ sheet_shift_y }} {{ sheet_z }} group 2D offset {{ offset_2d }} 0 0 0 0
 
 include         {{ potential_file }}
+
 balance         1.0 rcb
 
 {% if dump_enabled %}
@@ -26,6 +27,11 @@ dump            sys all atom {{ dump_freq }} {{ dump_file }}
 min_style       {{ min_style }}
 {{ minimization_command }}
 
+{% if finite_sheet_enabled and finite_sheet_edge_mode == 'spring' %}
+group           sheet_edge intersect 2D 2D_edge
+fix             fs_edge sheet_edge spring/self {{ finite_sheet_edge_spring_k }} xy
+{% endif %}
+
 timestep        {{ timestep }}
 thermo          {{ thermo }}
 
@@ -33,6 +39,7 @@ group           fixset union sub_fix {{ tip_fix_group }}
 group           system subtract all fixset
 
 velocity        system create {{ temp }} {{ range(1, 999999) | random }}
+velocity        2D zero angular
 
 {% if thermostat_type == 'langevin' %}
 compute         temp_tip tip_thermo temp/partial 0 1 0
@@ -43,7 +50,7 @@ compute         temp_sub sub_thermo temp/partial 0 1 0
 fix             lang_sub sub_thermo langevin {{ temp }} {{ temp }} $(100.0*dt) {{ range(1, 999999) | random }} zero yes
 fix_modify      lang_sub temp temp_sub
 
-group           nve_apply subtract all sub_fix tip_fix
+group           nve_apply subtract all sub_fix {{ tip_fix_group }}
 fix             nve_all nve_apply nve
 {% else %}
 fix             nvt_sys system nvt temp {{ temp }} {{ temp }} $(100.0*dt)
@@ -99,7 +106,7 @@ variable        disploop loop 50
 label           disp
 run             100 pre no post no
 if              '${dispz}>${disp_h}' then 'variable disp_h equal ${dispz}'
-if              '${dispz}<${disp_l}' then 'variable disp_l equal ${disp_l}'
+if              '${dispz}<${disp_l}' then 'variable disp_l equal ${dispz}'
 next            disploop
 jump            SELF disp
 

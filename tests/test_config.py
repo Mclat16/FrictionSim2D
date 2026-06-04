@@ -27,7 +27,7 @@ VALID_SHEET = {
 }
 VALID_SUB = {
     'mat': 'Si', 'pot_type': 'tersoff', 'pot_path': 'potentials/Si.tersoff',
-    'cif_path': 'Si.cif', 'thickness': 10.0
+    'cif_path': 'Si.cif', 'thickness': 10.0, 'amorph': 'a'
 }
 VALID_GENERAL = {'temp': 300.0}
 
@@ -148,6 +148,118 @@ def test_general_config_rejects_invalid_scan_angle_string() -> None:
     """scan_angle now only accepts numeric values."""
     with pytest.raises(ValidationError):
         GeneralConfig(scan_angle=[0, 90, 'all'])
+
+
+def test_tip_config_allows_explicit_tip_coordinates_with_offsets(tmp_path, monkeypatch) -> None:
+    """Tip placement fields should belong to [tip] and allow explicit+offset inputs."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings()
+    tip = dict(VALID_TIP)
+    tip.update({"tip_x": 10.0, "tip_y": 5.0, "tip_x_offset": 1.0, "tip_y_offset": -0.5})
+
+    cfg = AFMSimulationConfig(
+        general=VALID_GENERAL,
+        tip=tip,
+        sub=VALID_SUB,
+        **{'2D': VALID_SHEET},
+        settings=settings,
+    )
+    assert cfg.tip.tip_x == 10.0
+    assert cfg.tip.tip_y == 5.0
+    assert cfg.tip.tip_x_offset == 1.0
+    assert cfg.tip.tip_y_offset == -0.5
+
+
+def test_finite_sheet_requires_substrate_xy(tmp_path, monkeypatch):
+    """Finite-sheet AFM should require explicit substrate x/y in [sub]."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings()
+    with pytest.raises(ValidationError, match="requires substrate x and y"):
+        AFMSimulationConfig(
+            general={"temp": 300.0, "finite_sheet": True},
+            tip=VALID_TIP,
+            sub={**VALID_SUB, "amorph": "c"},
+            **{'2D': VALID_SHEET},
+            settings=settings,
+        )
+
+
+def test_finite_sheet_rejects_substrate_smaller_than_sheet(tmp_path, monkeypatch):
+    """Finite-sheet AFM should reject substrate sizes smaller than the sheet."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings()
+    bad_sub = dict(VALID_SUB)
+    bad_sub.update({"x": 40.0, "y": 60.0, "amorph": "c"})
+    with pytest.raises(ValidationError, match="cannot be smaller than sheet x"):
+        AFMSimulationConfig(
+            general={"temp": 300.0, "finite_sheet": True},
+            tip=VALID_TIP,
+            sub=bad_sub,
+            **{'2D': VALID_SHEET},
+            settings=settings,
+        )
+
+
+def test_finite_sheet_rejects_margin_not_above_lj_cutoff(tmp_path, monkeypatch):
+    """Finite-sheet AFM should enforce strict substrate-sheet delta > LJ cutoff."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings().model_copy(deep=True)
+    settings.potential.lj_cutoff = 11.0
+    bad_sub = dict(VALID_SUB)
+    bad_sub.update({"x": 61.0, "y": 70.0, "amorph": "c"})
+    # sheet x is 50, so x-delta is exactly 11.0 -> invalid (must be > cutoff)
+    with pytest.raises(ValidationError, match="greater than LJ cutoff"):
+        AFMSimulationConfig(
+            general={"temp": 300.0, "finite_sheet": True},
+            tip=VALID_TIP,
+            sub=bad_sub,
+            **{'2D': VALID_SHEET},
+            settings=settings,
+        )
+
+
+def test_non_finite_sheet_rejects_crystalline_substrate(tmp_path, monkeypatch):
+    """Non-finite-sheet AFM should allow only amorphous substrates."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings()
+    with pytest.raises(ValidationError, match="requires an amorphous substrate"):
+        AFMSimulationConfig(
+            general={"temp": 300.0, "finite_sheet": False},
+            tip=VALID_TIP,
+            sub={**VALID_SUB, "amorph": "c"},
+            **{'2D': VALID_SHEET},
+            settings=settings,
+        )
 
 
 # ---------------------------------------------------------------------------

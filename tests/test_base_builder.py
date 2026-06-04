@@ -22,7 +22,7 @@ def afm_config(tmp_path):
         'tip': {'mat': 'Si', 'pot_type': 'sw', 'pot_path': str(pot_path),
                 'cif_path': str(cif_path), 'r': 10.0, 'dspring': 0.0},
         'sub': {'mat': 'Si', 'pot_type': 'sw', 'pot_path': str(pot_path),
-                'cif_path': str(cif_path), 'thickness': 10.0},
+            'cif_path': str(cif_path), 'thickness': 10.0, 'amorph': 'a'},
         '2D': {'mat': 'h-MoS2', 'pot_type': 'sw', 'pot_path': str(pot_path),
                'cif_path': str(cif_path), 'x': 50.0, 'y': 50.0, 'layers': [1]},
         'lj_override': {},

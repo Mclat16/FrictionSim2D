@@ -113,6 +113,11 @@ class TypeRegistry:
         return sorted([t.type_id for t in self._types.values()
                 if t.component == component and t.layer == layer and t.element == element])
 
+    def ids_by_component_region(self, component: str, region: Optional[str]) -> List[int]:
+        """Type IDs for a specific region of a component."""
+        return sorted([t.type_id for t in self._types.values()
+                if t.component == component and t.region == region])
+
     def elements_in_component(self, component: str) -> List[str]:
         """Unique elements in a component (preserving order of first occurrence)."""
         seen = set()
@@ -200,6 +205,11 @@ class TypeRegistry:
             Space-separated string of type IDs for that layer.
         """
         all_ids = self.ids_by_component_layer(component, layer)
+        return " ".join(map(str, all_ids))
+
+    def get_region_group_string(self, component: str, region: Optional[str]) -> str:
+        """Return type IDs for a specific region of a component."""
+        all_ids = self.ids_by_component_region(component, region)
         return " ".join(map(str, all_ids))
 
 class PotentialManager:
@@ -388,7 +398,8 @@ class PotentialManager:
         self,
         name: str,
         config: ComponentConfig,
-        n_layers: int = 1
+        n_layers: int = 1,
+        regions: Optional[List[Optional[str]]] = None,
     ) -> Dict[str, List[int]]:
         """Register a material component and assign unique global atom type IDs.
 
@@ -400,6 +411,7 @@ class PotentialManager:
             name: Unique identifier (e.g., 'tip', 'sheet', 'sub').
             config: The material configuration.
             n_layers: Number of layers (for 2D materials, default 1).
+            regions: Optional list of region identifiers to expand per type.
 
         Returns:
             Dict mapping element names to their global atom type IDs.
@@ -415,11 +427,11 @@ class PotentialManager:
         apply_langevin = self.use_langevin and name in ('tip', 'sub')
 
         if n_layers > 1:
-            self._assign_types(name, elements, pot_counts, n_layers, use_layer_ids=True)
+            self._assign_types(name, elements, pot_counts, n_layers, use_layer_ids=True, regions=regions)
         elif apply_langevin:
             self._assign_types(name, elements, pot_counts, regions=[None, 'fix', 'thermo'])
         else:
-            self._assign_types(name, elements, pot_counts)
+            self._assign_types(name, elements, pot_counts, regions=regions)
 
         component_map = self.types.get_element_map(name)
 
@@ -862,6 +874,17 @@ class PotentialManager:
                 if all_types:
                     types_str = ' '.join(map(str, all_types))
                     lines.append(f"group 2D_all type {types_str}")
+
+                core_types = [atype.type_id for atype in self.types if atype.component == name and atype.region is None]
+                edge_types = [atype.type_id for atype in self.types if atype.component == name and atype.region == 'edge']
+
+                if core_types:
+                    types_str = ' '.join(map(str, core_types))
+                    lines.append(f"group 2D_core type {types_str}")
+
+                if edge_types:
+                    types_str = ' '.join(map(str, edge_types))
+                    lines.append(f"group 2D_edge type {types_str}")
 
                 if n_layers > 1:
                     for layer in range(n_layers):

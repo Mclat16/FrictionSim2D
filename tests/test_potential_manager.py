@@ -686,6 +686,22 @@ class TestFileOutput:
         assert 'layer_1' in layer_groups
         assert 'layer_4' in layer_groups
 
+    def test_write_file_includes_sheet_edge_groups(
+        self, mock_settings, mos2_sheet_config, mock_cifread_mos2, mock_count_atomtypes_mos2_simple
+    ):
+        """Sheet edge typing should emit core and edge groups."""
+        pm = PotentialManager(mock_settings, use_langevin=False)
+        pm.register_component('sheet', mos2_sheet_config, n_layers=1, regions=[None, 'edge'])
+        pm.add_self_interaction('sheet')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / 'system.in.settings'
+            pm.write_file(output_path)
+
+            content = output_path.read_text()
+            assert 'group 2D_core type' in content
+            assert 'group 2D_edge type' in content
+
 
 # =========================================================================
 # Gap Calculation Tests

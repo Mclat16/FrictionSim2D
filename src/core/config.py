@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import List, Optional, Union, Dict, Any, Literal, cast
 import yaml
-from pydantic import BaseModel, Field, field_validator, ValidationInfo
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from .utils import read_config, get_potential_path, get_material_path
 
@@ -22,6 +22,16 @@ class GeometrySettings(BaseModel):
     rigid_tip: bool = False
     tip_base_z: float = 55.0
     lat_c_default: float = 6.0
+    finite_sheet_edge_width: float = Field(
+        default=4.0,
+        description="Edge band width for finite-sheet runs (Angstrom), typically 1-2 atoms.",
+    )
+    finite_sheet_afm_edge_mode: Literal['none', 'spring'] = 'none'
+    finite_sheet_edge_spring_k: float = Field(
+        default=10.0,
+        description="Spring constant (eV/Å²) for 'spring' edge mode. Controls how tightly edge atoms are tethered to their initial positions.",
+    )
+    finite_sheet_sheetonsheet_edge_mode: Literal['none', 'rigid'] = 'none'
 
 class ThermostatSettings(BaseModel):
     """Thermostat and time integration settings."""
@@ -47,6 +57,7 @@ class SimulationSettings(BaseModel):
     drive_method: Literal['smd', 'fix_move', 'virtual_atom'] = 'virtual_atom'
     constraint_mode: Literal['atom_bonds', 'com_spring', 'none'] = 'none'
 
+
 class QuenchSettings(BaseModel):
     """Quenching parameters for amorphous material generation."""
     run_local: bool = True
@@ -66,7 +77,7 @@ class OutputSettings(BaseModel):
     dump: Dict[str, bool] = Field(
         default_factory=lambda: {'system_init': True, 'slide': True})
     dump_frequency: Dict[str, int] = Field(
-        default_factory=lambda: {'system_init': 10000, 'slide': 10000})
+        default_factory=lambda: {'system_init': 1000, 'slide': 10000})
     results_frequency: int = 1000
 
 class PotentialSettings(BaseModel):
@@ -213,6 +224,22 @@ class TipConfig(ComponentConfig):
     r: float = Field(..., description="Tip radius in Angstroms")
     amorph: Literal['c', 'a'] = Field('c', description="'c' for crystalline, 'a' for amorphous")
     dspring: float = Field(0.0, description="Damping constant")
+    tip_x: Optional[float] = Field(
+        default=None,
+        description="Optional absolute AFM tip x-position in box coordinates.",
+    )
+    tip_y: Optional[float] = Field(
+        default=None,
+        description="Optional absolute AFM tip y-position in box coordinates.",
+    )
+    tip_x_offset: float = Field(
+        default=0.0,
+        description="AFM tip x-offset applied only when tip_x is not explicitly set.",
+    )
+    tip_y_offset: float = Field(
+        default=0.0,
+        description="AFM tip y-offset applied only when tip_y is not explicitly set.",
+    )
 
     @field_validator('amorph', mode='before')
     @classmethod
@@ -223,6 +250,14 @@ class TipConfig(ComponentConfig):
 class SubstrateConfig(ComponentConfig):
     """Substrate configuration parameters."""
     thickness: float
+    x: Optional[float] = Field(
+        default=None,
+        description="Finite-sheet substrate size in x (same units as sheet x).",
+    )
+    y: Optional[float] = Field(
+        default=None,
+        description="Finite-sheet substrate size in y (same units as sheet y).",
+    )
     amorph: Literal['c', 'a'] = Field('c', description="'c' for crystalline, 'a' for amorphous")
     @field_validator('amorph', mode='before')
     @classmethod
@@ -262,6 +297,10 @@ class GeneralConfig(BaseModel):
     )
     bond_spring: Optional[float] = Field(80.0, description="Spring constant for harmonically bonded sheets")
     driving_spring: Optional[float] = Field(50, description="Driving spring constant for virtual atom method")
+    finite_sheet: bool = Field(
+        default=False,
+        description="Enable finite-sheet AFM geometry for this run.",
+    )
 
 
 class AFMSimulationConfig(BaseModel):
@@ -272,6 +311,57 @@ class AFMSimulationConfig(BaseModel):
     sheet: SheetConfig = Field(..., alias='2D')
     lj_override: Dict[str, Any] = Field(default_factory=dict, alias='lj_override')
     settings: GlobalSettings
+
+    @model_validator(mode='after')
+    def validate_non_finite_sheet_substrate(self) -> 'AFMSimulationConfig':
+        """Require amorphous substrate when AFM finite-sheet mode is disabled."""
+        if not self.general.finite_sheet and self.sub.amorph != 'a':
+            raise ValueError(
+                "Non-finite-sheet AFM requires an amorphous substrate "
+                "(set [sub] amorph = a)."
+            )
+        return self
+
+    @model_validator(mode='after')
+    def validate_finite_sheet_geometry(self) -> 'AFMSimulationConfig':
+        """Validate finite-sheet substrate sizing against the sheet footprint."""
+        if not self.general.finite_sheet:
+            return self
+
+        if self.sub.x is None or self.sub.y is None:
+            raise ValueError(
+                "Finite-sheet AFM requires substrate x and y to be set in the [sub] section."
+            )
+
+        sheet_x = float(self.sheet.x[0] if isinstance(self.sheet.x, list) else self.sheet.x)
+        sheet_y = float(self.sheet.y[0] if isinstance(self.sheet.y, list) else self.sheet.y)
+        sub_x = float(self.sub.x)
+        sub_y = float(self.sub.y)
+
+        if sub_x < sheet_x:
+            raise ValueError(
+                f"Finite-sheet substrate x ({sub_x}) cannot be smaller than sheet x ({sheet_x})."
+            )
+        if sub_y < sheet_y:
+            raise ValueError(
+                f"Finite-sheet substrate y ({sub_y}) cannot be smaller than sheet y ({sheet_y})."
+            )
+
+        lj_cutoff = float(self.settings.potential.lj_cutoff)
+        margin_x = sub_x - sheet_x
+        margin_y = sub_y - sheet_y
+        if margin_x <= lj_cutoff:
+            raise ValueError(
+                "Finite-sheet AFM requires (substrate_x - sheet_x) to be greater than LJ cutoff "
+                f"({lj_cutoff}). Got {margin_x}."
+            )
+        if margin_y <= lj_cutoff:
+            raise ValueError(
+                "Finite-sheet AFM requires (substrate_y - sheet_y) to be greater than LJ cutoff "
+                f"({lj_cutoff}). Got {margin_y}."
+            )
+
+        return self
 
 class SheetOnSheetSimulationConfig(BaseModel):
     """Master configuration object for a Sheet-on-Sheet simulation run."""

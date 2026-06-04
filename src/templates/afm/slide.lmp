@@ -45,6 +45,14 @@ comm_style      tiled
 read_data       {{ output_dir }}/load_$(v_find)N.data
 include         {{ potential_file }}
 
+group           2D type {{ sheet_types }}
+velocity        2D zero angular
+
+{% if finite_sheet_enabled and finite_sheet_edge_mode == 'spring' %}
+group           sheet_edge intersect 2D 2D_edge
+fix             fs_edge sheet_edge spring/self {{ finite_sheet_edge_spring_k }} xy
+{% endif %}
+
 
 {% if dump_enabled %}
 dump            sys all atom {{ dump_freq }} {{ dump_file_pattern }}

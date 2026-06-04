@@ -12,7 +12,7 @@ from typing import Dict, Optional, Tuple
 from ..core.simulation_base import SimulationBase
 from ..core.config import AFMSimulationConfig
 from ..core.potential_manager import PotentialManager
-from ..core.utils import normalize_potential_type
+from ..core.utils import get_model_dimensions, normalize_potential_type
 from ..data.models import EV_A_TO_NN
 from . import components
 
@@ -38,6 +38,8 @@ class AFMSimulation(SimulationBase):
         self.pm: Dict[int, PotentialManager] = {}
         self.lat_c: Optional[float] = None
         self.sheet_dims: Dict[str, float] = {}
+        self.box_dims: Dict[str, float] = {}
+        self.sheet_offset: Dict[str, float] = {'x': 0.0, 'y': 0.0}
         self.output_dir_layer: Dict[int, Path] = {}
         self.relative_run_dir_layer: Dict[int, Path] = {}
 
@@ -65,14 +67,25 @@ class AFMSimulation(SimulationBase):
                 self.config.sheet, build_dir,
                 stack_if_multi=True, settings=self.config.settings,
                     n_layers_override=n_layers,
-                    stacking_type=stacking_type
+                    stacking_type=stacking_type,
+                    edge_mode=(
+                        self.config.settings.geometry.finite_sheet_afm_edge_mode
+                        if self.config.general.finite_sheet else 'none'
+                    ),
+                    edge_width=self.config.settings.geometry.finite_sheet_edge_width,
             )
             self.sheet_paths[n_layers] = sheet_path
             if self.lat_c is None:
                 self.lat_c = lat_c
-                self.sheet_dims = sheet_dims
+                self.sheet_dims = dict(sheet_dims)
+
+        if not self.sheet_dims:
+            raise ValueError("No sheet dimensions were generated during AFM build.")
 
         self.tip_path, tip_radius, self.sub_path = self._build_components(build_dir)
+        self.box_dims = self._get_substrate_box_dims()
+        self._validate_final_substrate_dims()
+        self.sheet_offset = self._compute_sheet_offset()
 
         for n_layers in self.config.sheet.layers:
             self.pm[n_layers] = self._generate_potentials(n_layers)
@@ -115,8 +128,12 @@ class AFMSimulation(SimulationBase):
         logger.info("Built tip: %s", tip_path.name)
 
         sub_path = components.build_substrate(
-            self.config.sub, build_dir, self.sheet_dims,
-            settings=self.config.settings
+            self.config.sub,
+            build_dir,
+            self.sheet_dims,
+            settings=self.config.settings,
+            target_x=self.config.sub.x if self.config.general.finite_sheet else None,
+            target_y=self.config.sub.y if self.config.general.finite_sheet else None,
         )
         logger.info("Built substrate: %s", sub_path.name)
 
@@ -143,6 +160,62 @@ class AFMSimulation(SimulationBase):
             logger.info("Applied Langevin regions to substrate")
 
         return tip_path, tip_radius, sub_path
+
+    def _get_substrate_box_dims(self) -> Dict[str, float]:
+        """Return substrate box dimensions from the generated substrate data file."""
+        dims = get_model_dimensions(self.sub_path)
+        required = ['xlo', 'xhi', 'ylo', 'yhi', 'zlo', 'zhi']
+        
+        return {key: float(dims[key]) for key in required}
+
+    def _validate_final_substrate_dims(self) -> None:
+        """Validate finite-sheet constraints against final substrate dimensions."""
+        if not self.config.general.finite_sheet:
+            return
+
+        sheet_x = float(self.sheet_dims['xhi'] - self.sheet_dims['xlo'])
+        sheet_y = float(self.sheet_dims['yhi'] - self.sheet_dims['ylo'])
+        sub_x = float(self.box_dims['xhi'] - self.box_dims['xlo'])
+        sub_y = float(self.box_dims['yhi'] - self.box_dims['ylo'])
+
+        if sub_x < sheet_x:
+            raise ValueError(
+                "Final substrate x from built .lmp is smaller than sheet x: "
+                f"sub_x={sub_x}, sheet_x={sheet_x}."
+            )
+        if sub_y < sheet_y:
+            raise ValueError(
+                "Final substrate y from built .lmp is smaller than sheet y: "
+                f"sub_y={sub_y}, sheet_y={sheet_y}."
+            )
+
+        lj_cutoff = float(self.config.settings.potential.lj_cutoff)
+        margin_x = sub_x - sheet_x
+        margin_y = sub_y - sheet_y
+        if margin_x <= lj_cutoff:
+            raise ValueError(
+                "Final built substrate x-span delta must be greater than LJ cutoff. "
+                f"Got margin_x={margin_x}, LJ cutoff={lj_cutoff}."
+            )
+        if margin_y <= lj_cutoff:
+            raise ValueError(
+                "Final built substrate y-span delta must be greater than LJ cutoff. "
+                f"Got margin_y={margin_y}, LJ cutoff={lj_cutoff}."
+            )
+
+    def _compute_sheet_offset(self) -> Dict[str, float]:
+        """Center the sheet inside the substrate footprint when finite-sheet is enabled."""
+        if not self.config.general.finite_sheet:
+            return {'x': 0.0, 'y': 0.0}
+
+        sheet_center_x = (self.sheet_dims['xlo'] + self.sheet_dims['xhi']) / 2.0
+        sheet_center_y = (self.sheet_dims['ylo'] + self.sheet_dims['yhi']) / 2.0
+        box_center_x = (self.box_dims['xlo'] + self.box_dims['xhi']) / 2.0
+        box_center_y = (self.box_dims['ylo'] + self.box_dims['yhi']) / 2.0
+        return {
+            'x': box_center_x - sheet_center_x,
+            'y': box_center_y - sheet_center_y,
+        }
 
     def _calculate_z_positions(self, n_layers: int, tip_radius: float) -> None:
         """Calculates vertical positions for all components.
@@ -198,10 +271,12 @@ class AFMSimulation(SimulationBase):
             n_sheet_layers > 1 and
             pm.is_sheet_lj(self.config.sheet.pot_type)
         )
+        sheet_edge_regions = [None, 'edge'] if self.config.general.finite_sheet and self.config.settings.geometry.finite_sheet_afm_edge_mode != 'none' else None
         pm.register_component(
             'sheet',
             self.config.sheet,
-            n_layers=n_sheet_layers if sheet_needs_layer_types else 1
+            n_layers=n_sheet_layers if sheet_needs_layer_types else 1,
+            regions=sheet_edge_regions,
         )
 
         if self.config.settings.simulation.drive_method == 'virtual_atom':
@@ -242,7 +317,8 @@ class AFMSimulation(SimulationBase):
         logger.info("Writing LAMMPS inputs...")
 
         pm = self.pm[n_layers]
-        sheet_dims = self.sheet_dims
+        box_dims = self.box_dims
+        sheet_offset = self.sheet_offset
         lat_c = self.lat_c
         z_positions = self.z_positions[n_layers]
         groups = self.groups[n_layers]
@@ -266,12 +342,21 @@ class AFMSimulation(SimulationBase):
         if self.config.general.scan_speed is None:
             raise ValueError("scan_speed must be specified in [general] section")
 
-        xlo, xhi = self.sheet_dims['xlo'], self.sheet_dims['xhi']
-        ylo, yhi = self.sheet_dims['ylo'], self.sheet_dims['yhi']
+        xlo, xhi = box_dims['xlo'], box_dims['xhi']
+        ylo, yhi = box_dims['ylo'], box_dims['yhi']
         zhi_box = z_positions['tip'] + 50.0
 
-        tip_x = (xlo + xhi) / 2.0
-        tip_y = (ylo + yhi) / 2.0
+        default_tip_x = ((self.sheet_dims['xlo'] + self.sheet_dims['xhi']) / 2.0) + sheet_offset['x']
+        default_tip_y = ((self.sheet_dims['ylo'] + self.sheet_dims['yhi']) / 2.0) + sheet_offset['y']
+        if self.config.tip.tip_x is not None:
+            tip_x = float(self.config.tip.tip_x)
+        else:
+            tip_x = default_tip_x + float(self.config.tip.tip_x_offset)
+
+        if self.config.tip.tip_y is not None:
+            tip_y = float(self.config.tip.tip_y)
+        else:
+            tip_y = default_tip_y + float(self.config.tip.tip_y_offset)
         tip_z = z_positions['tip']
 
         sub_natypes = len(groups['sub_types'].split())
@@ -299,6 +384,8 @@ class AFMSimulation(SimulationBase):
             'tip_x': tip_x,
             'tip_y': tip_y,
             'tip_z': tip_z,
+            'sheet_shift_x': sheet_offset['x'],
+            'sheet_shift_y': sheet_offset['y'],
             'sheet_z': z_positions['sheet'],
             'offset_2d': offset_2d,
             'results_file_pattern': (f"{self.relative_run_dir_layer[n_layers]}/results/"
@@ -331,7 +418,7 @@ class AFMSimulation(SimulationBase):
             'n_sheet_layers': n_layers,
             'lat_c': lat_c,
             'tip_radius': self.config.tip.r,
-            'sheet_dims': sheet_dims,
+            'box_dims': box_dims,
             'thermostat_type': self.config.settings.thermostat.type,
             'use_langevin': self.config.settings.thermostat.type == 'langevin',
             'min_style': sim.min_style,
@@ -340,6 +427,10 @@ class AFMSimulation(SimulationBase):
             'dump_file': f"{self.relative_run_dir_layer[n_layers]}/visuals/system.lammpstrj",
             'atom_style': atom_style,
             'ev_a_to_nn': EV_A_TO_NN,
+            'finite_sheet_enabled': bool(self.config.general.finite_sheet),
+            'finite_sheet_edge_mode': self.config.settings.geometry.finite_sheet_afm_edge_mode,
+            'finite_sheet_edge_width': self.config.settings.geometry.finite_sheet_edge_width,
+            'finite_sheet_edge_spring_k': self.config.settings.geometry.finite_sheet_edge_spring_k,
         }
 
         init_script = self.render_template("afm/system_init.lmp", context)

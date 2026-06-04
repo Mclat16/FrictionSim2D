@@ -41,6 +41,7 @@ def _make_afm_config(tmp_path: Path, layers: list[int]) -> AFMSimulationConfig:
                 "pot_path": str(pot_path),
                 "cif_path": str(cif_path),
                 "thickness": 10.0,
+                "amorph": "a",
             },
             "2D": {
                 "mat": "h-MoS2",
@@ -145,6 +146,10 @@ def test_afm_build_orchestrates_per_layer_steps(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr("src.builders.components.build_sheet", mock_build_sheet)
     monkeypatch.setattr("src.builders.afm.AFMSimulation._init_provenance", lambda *_a, **_k: None)
     monkeypatch.setattr(
+        "src.builders.afm.AFMSimulation._get_substrate_box_dims",
+        lambda _self: {"xlo": 0.0, "xhi": 100.0, "ylo": 0.0, "yhi": 100.0, "zlo": -5.0, "zhi": 0.0},
+    )
+    monkeypatch.setattr(
         "src.builders.afm.AFMSimulation._create_directories",
         lambda _self, out_dir=None: called["create_dirs"].append(out_dir),
     )
@@ -204,6 +209,33 @@ def _prepare_builder_for_slide_write(builder: AFMSimulation, tmp_path: Path) -> 
     }
     builder.pm[1] = SimpleNamespace(types=[1, 2, 3])
     builder.lat_c = 6.0
+    sheet_dims = {
+        "xlo": 0.0,
+        "xhi": 100.0,
+        "ylo": 0.0,
+        "yhi": 100.0,
+        "zlo": 0.0,
+        "zhi": 12.0,
+    }
+    builder.sheet_dims = dict(sheet_dims)
+    builder.box_dims = dict(sheet_dims)
+    builder.sheet_offset = {"x": 0.0, "y": 0.0}
+
+    for path in (builder.sheet_paths[1], builder.tip_path, builder.sub_path):
+        path.write_text("# dummy\n", encoding="utf-8")
+
+    builder.write_inputs(1)
+    return layer_dir / "lammps" / "slide.in"
+
+
+def test_afm_finite_sheet_computes_box_and_center_offsets(tmp_path: Path) -> None:
+    """Finite-sheet mode should use substrate x/y as box and center the sheet."""
+    config = _make_afm_config(tmp_path, layers=[1])
+    config.general.finite_sheet = True
+    config.sub.x = 160.0
+    config.sub.y = 140.0
+
+    builder = AFMSimulation(config, output_dir=str(tmp_path / "out"))
     builder.sheet_dims = {
         "xlo": 0.0,
         "xhi": 100.0,
@@ -212,12 +244,51 @@ def _prepare_builder_for_slide_write(builder: AFMSimulation, tmp_path: Path) -> 
         "zlo": 0.0,
         "zhi": 12.0,
     }
+    builder.box_dims = {
+        "xlo": 0.0,
+        "xhi": 160.0,
+        "ylo": 0.0,
+        "yhi": 140.0,
+        "zlo": -5.0,
+        "zhi": 0.0,
+    }
 
-    for path in (builder.sheet_paths[1], builder.tip_path, builder.sub_path):
-        path.write_text("# dummy\n", encoding="utf-8")
+    offsets = builder._compute_sheet_offset()
 
-    builder.write_inputs(1)
-    return layer_dir / "lammps" / "slide.in"
+    assert builder.box_dims["xhi"] == 160.0
+    assert builder.box_dims["yhi"] == 140.0
+    assert offsets == {"x": 30.0, "y": 20.0}
+
+
+def test_afm_finite_sheet_validates_final_substrate_dims(tmp_path: Path) -> None:
+    """Final substrate dims from .lmp should be validated, not only requested config dims."""
+    config = _make_afm_config(tmp_path, layers=[1])
+    config.general.finite_sheet = True
+    config.sub.x = 160.0
+    config.sub.y = 140.0
+    config.settings.potential.lj_cutoff = 11.0
+
+    builder = AFMSimulation(config, output_dir=str(tmp_path / "out"))
+    builder.sheet_dims = {
+        "xlo": 0.0,
+        "xhi": 100.0,
+        "ylo": 0.0,
+        "yhi": 100.0,
+        "zlo": 0.0,
+        "zhi": 12.0,
+    }
+    # Simulate post-build substrate dimensions read from sub.lmp.
+    builder.box_dims = {
+        "xlo": 0.0,
+        "xhi": 110.0,
+        "ylo": 0.0,
+        "yhi": 110.0,
+        "zlo": -5.0,
+        "zhi": 0.0,
+    }
+
+    with pytest.raises(ValueError, match="Final built substrate x-span delta must be greater than LJ cutoff"):
+        builder._validate_final_substrate_dims()
 
 
 def test_afm_scan_angle_list_with_force_gate(tmp_path: Path) -> None:
@@ -266,3 +337,29 @@ def test_afm_scan_angle_force_accepts_multiple_targets(tmp_path: Path) -> None:
     assert "variable        scan_angle_force index 10.0 30.0" in slide_script
     assert "abs(v_find-v_scan_angle_force) < 1.0e-12" in slide_script
     assert "then \"next scan_angle_force\"" in slide_script
+
+
+def test_afm_explicit_tip_x_ignores_tip_x_offset(tmp_path: Path) -> None:
+    """Explicit tip_x should be used exactly; tip_x_offset should not be applied."""
+    config = _make_afm_config(tmp_path, layers=[1])
+    config.tip.tip_x = 33.0
+    config.tip.tip_x_offset = 7.5
+
+    builder = AFMSimulation(config, output_dir=str(tmp_path / "out"))
+    layer_dir = _prepare_builder_for_slide_write(builder, tmp_path).parent
+    system_script = (layer_dir / "system.in").read_text(encoding="utf-8")
+
+    assert "shift 33.0" in system_script
+
+
+def test_afm_explicit_tip_y_ignores_tip_y_offset(tmp_path: Path) -> None:
+    """Explicit tip_y should be used exactly; tip_y_offset should not be applied."""
+    config = _make_afm_config(tmp_path, layers=[1])
+    config.tip.tip_y = 41.0
+    config.tip.tip_y_offset = -3.0
+
+    builder = AFMSimulation(config, output_dir=str(tmp_path / "out"))
+    layer_dir = _prepare_builder_for_slide_write(builder, tmp_path).parent
+    system_script = (layer_dir / "system.in").read_text(encoding="utf-8")
+
+    assert " 41.0 " in system_script

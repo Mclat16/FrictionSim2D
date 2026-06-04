@@ -681,7 +681,8 @@ def stack_multilayer_sheet(
     lat_c: Optional[float] = None,
     settings: Optional[GlobalSettings] = None,
     use_pair_bonding: bool = False,
-    stacking_type: str = 'AB'
+    stacking_type: str = 'AB',
+    edge_mode: str = 'none'
 ) -> float:
     """Stack multiple 2D material layers with proper atom type renumbering.
     
@@ -719,7 +720,8 @@ def stack_multilayer_sheet(
     pot_file = Path(tempfile.gettempdir()) / f"sheet_{layers_for_setup}_{uuid.uuid4().hex[:8]}.in.settings"
 
     pm = PotentialManager(settings)
-    pm.register_component("sheet", config, n_layers=layers_for_setup)
+    regions = [None, 'edge'] if edge_mode != 'none' else None
+    pm.register_component("sheet", config, n_layers=layers_for_setup, regions=regions)
     pm.add_self_interaction("sheet")
 
     if pm.is_sheet_lj(config.pot_type):
@@ -799,7 +801,8 @@ def stack_multilayer_sheet(
                     lat_c=lat_c,
                     settings=settings,
                     use_pair_bonding=use_pair_bonding,
-                    stacking_type=stacking_type
+                    stacking_type=stacking_type,
+                    edge_mode=edge_mode
                 )
 
         lat_c = lat_c or initial_guess
@@ -884,15 +887,19 @@ def build_substrate(
     config: SubstrateConfig,
     build_dir: Path,
     box_dims: dict,
-    settings: Optional[GlobalSettings] = None
+    settings: Optional[GlobalSettings] = None,
+    target_x: Optional[float] = None,
+    target_y: Optional[float] = None,
     ) -> Path:
     """Build substrate slab.
     
     Args:
         config: Substrate configuration.
         build_dir: Output directory.
-        box_dims: Target box dimensions from sheet.
+        box_dims: Reference box dimensions from sheet.
         settings: Global settings (required for amorphous).
+        target_x: Optional explicit substrate size in x.
+        target_y: Optional explicit substrate size in y.
         
     Returns:
         Path to substrate file.
@@ -901,8 +908,8 @@ def build_substrate(
     cif_path = get_material_path(config.cif_path)
     base_lmp = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_base.lmp"
     final_lmp = build_dir / "sub.lmp"
-    target_x = box_dims['xhi'] - box_dims['xlo']
-    target_y = box_dims['yhi'] - box_dims['ylo']
+    target_x = float(target_x) if target_x is not None else box_dims['xhi'] - box_dims['xlo']
+    target_y = float(target_y) if target_y is not None else box_dims['yhi'] - box_dims['ylo']
     target_z = config.thickness
 
     _create_base_slab(
@@ -911,6 +918,18 @@ def build_substrate(
         output_path=base_lmp, build_dir=build_dir,
         settings=settings or GlobalSettings()
     )
+
+    # Preserve periodic tiling for crystalline substrates by using the
+    # commensurate replicated slab span in x/y instead of forcing a non-
+    # commensurate crop to the requested target.
+    if config.amorph == 'a':
+        box_x_span = target_x
+        box_y_span = target_y
+    else:
+        base_dims = get_model_dimensions(base_lmp)
+        assert all(base_dims[k] is not None for k in ['xlo', 'xhi', 'ylo', 'yhi'])
+        box_x_span = cast(float, base_dims['xhi']) - cast(float, base_dims['xlo'])
+        box_y_span = cast(float, base_dims['yhi']) - cast(float, base_dims['ylo'])
 
     jinja_env = Environment(
         loader=PackageLoader('src.templates'),
@@ -921,9 +940,9 @@ def build_substrate(
     context = {
         'base_lmp': base_lmp,
         'box_xlo': box_dims['xlo'],
-        'box_xhi': box_dims['xhi'],
+        'box_xhi': box_dims['xlo'] + box_x_span,
         'box_ylo': box_dims['ylo'],
-        'box_yhi': box_dims['yhi'],
+        'box_yhi': box_dims['ylo'] + box_y_span,
         'box_zlo': box_dims['zlo'],
         'target_z': target_z,
         'output_path': final_lmp
@@ -1017,8 +1036,40 @@ def apply_langevin_regions(
 
     return component_path
 
+
+def apply_sheet_edge_types(component_path: Path, edge_width: float) -> Path:
+    """Split a built sheet into core and edge atom types."""
+    if edge_width <= 0:
+        return component_path
+
+    num_types = get_num_atom_types(component_path)
+    if num_types < 1:
+        return component_path
+
+    jinja_env = Environment(
+        loader=PackageLoader('src.templates'),
+        trim_blocks=True,
+        lstrip_blocks=True
+    )
+
+    context = {
+        'input_path': component_path,
+        'num_types': num_types,
+        'edge_width': edge_width,
+    }
+
+    template = jinja_env.get_template('common/apply_sheet_edge_types.lmp')
+    commands = template.render(context).strip().split('\n')
+    commands = [cmd.strip() for cmd in commands if cmd.strip() and not cmd.strip().startswith('#')]
+
+    run_lammps_commands(commands)
+
+    return component_path
+
 def build_monolayer(
     config: SheetConfig,
+    edge_mode: str = 'none',
+    edge_width: float = 0.0,
 ) -> Tuple[Path, dict, dict, int, Dict[str, float]]:
     """Build single-layer 2D material sheet.
     
@@ -1135,10 +1186,17 @@ def build_monolayer(
     shift_atoms_to_z_zero(base_path)
     dims = get_model_dimensions(base_path)
 
+    edge_enabled = edge_mode != 'none'
+    if edge_enabled:
+        apply_sheet_edge_types(base_path, edge_width=edge_width)
+
     if config.pot_type in ['tersoff', 'sw', 'rebo', 'airebo']:
         charge2atom(base_path)
     elif config.pot_type in ['reaxff', 'reax/c']:
         atomic2charge(base_path)
+
+    if edge_enabled:
+        total_pot_types *= 2
 
     observed_types = get_num_atom_types(base_path)
     if observed_types != total_pot_types:
@@ -1162,7 +1220,9 @@ def build_sheet(
     settings: Optional[GlobalSettings] = None,
     n_layers_override: Optional[int] = None,
     use_pair_bonding: bool = False,
-    stacking_type: str = 'AB'
+    stacking_type: str = 'AB',
+    edge_mode: str = 'none',
+    edge_width: float = 0.0,
 ) -> Tuple[Path, dict, Optional[float]]:
     """Build 2D material sheet (single or multi-layer).
     
@@ -1179,7 +1239,9 @@ def build_sheet(
         Tuple of (path, box_dims, lat_c).
     """
     base_path, dims, pot_counts, total_pot_types, supercell_dims = build_monolayer(
-        config
+        config,
+        edge_mode=edge_mode,
+        edge_width=edge_width,
     )
 
     n_layers = n_layers_override or (max(config.layers) if config.layers else 1)
@@ -1202,7 +1264,8 @@ def build_sheet(
             lat_c=lat_c,
             settings=settings,
             use_pair_bonding=use_pair_bonding,
-            stacking_type=stacking_type
+            stacking_type=stacking_type,
+            edge_mode=edge_mode,
         )
         return stacked_path, dims, lat_c
 

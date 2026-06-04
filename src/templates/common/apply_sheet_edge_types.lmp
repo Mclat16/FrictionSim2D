@@ -1,0 +1,37 @@
+# LAMMPS commands for splitting a built sheet into core and edge atom types
+
+units metal
+atom_style atomic
+boundary p p p
+
+read_data {{ input_path }} extra/atom/types {{ num_types }}
+
+variable        sheet_xlo equal bound(all,xmin)
+variable        sheet_xhi equal bound(all,xmax)
+variable        sheet_ylo equal bound(all,ymin)
+variable        sheet_yhi equal bound(all,ymax)
+region          fs_core block $(v_sheet_xlo+{{ edge_width }}) $(v_sheet_xhi-{{ edge_width }}) $(v_sheet_ylo+{{ edge_width }}) $(v_sheet_yhi-{{ edge_width }}) INF INF units box
+group           sheet_core region fs_core
+group           sheet_edge subtract all sheet_core
+
+{% for t in range(1, num_types + 1) %}
+group {{ t }}_orig type {{ t }}
+{% endfor %}
+
+{% for t in range(1, num_types + 1) %}
+{% set type_core = (t - 1) * 2 + 1 %}
+{% set type_edge = (t - 1) * 2 + 2 %}
+set group {{ t }}_orig type {{ type_core }}
+group {{ t }}_edge intersect sheet_edge {{ t }}_orig
+set group {{ t }}_edge type {{ type_edge }}
+group {{ t }}_edge delete
+group {{ t }}_orig delete
+{% endfor %}
+
+# Temporary masses are needed for newly created types so write_data succeeds.
+# Final per-type masses are set later in system.in.settings.
+{% for t in range(1, (num_types * 2) + 1) %}
+mass {{ t }} 1.0
+{% endfor %}
+
+write_data {{ input_path }}
