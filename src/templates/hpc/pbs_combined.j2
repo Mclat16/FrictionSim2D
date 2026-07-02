@@ -1,0 +1,105 @@
+#!/bin/bash
+#PBS -l select={{ select_multi if array_size > 1 else select_single }}
+#PBS -l walltime={{ walltime }}
+{% if array_size > 1 %}
+#PBS -J 1-{{ array_size }}
+#PBS -o {{ log_dir }}/{{ job_name }}_^array_index^_out.txt
+#PBS -e {{ log_dir }}/{{ job_name }}_^array_index^_err.txt
+{% else %}
+#PBS -o {{ log_dir }}/{{ job_name }}_out.txt
+#PBS -e {{ log_dir }}/{{ job_name }}_err.txt
+{% endif %}
+#PBS -N {{ job_name }}
+{% if queue %}
+#PBS -q {{ queue }}
+{% endif %}
+{% if account %}
+#PBS -A {{ account }}
+{% endif %}
+
+module purge
+{% for mod in modules %}
+module load {{ mod }}
+{% endfor %}
+
+{% if array_size > 1 %}
+TASK_ID=${PBS_ARRAY_INDEX}
+{% else %}
+TASK_ID=1
+{% endif %}
+
+SIM_PATH=$(sed -n "${TASK_ID}p" $PBS_O_WORKDIR/hpc/{{ manifest_filename }})
+
+if [ -z "$SIM_PATH" ]; then
+    echo "Error: No simulation path for index ${TASK_ID}"
+    exit 1
+fi
+
+# Strip any sim-root prefix that sits above afm/ or sheetonsheet/ (e.g. the
+# K50_zeta0p1/ directory in a multi-sim array job). LAMMPS must be run from
+# the directory that contains afm/ because that is what the relative paths
+# inside the generated LAMMPS scripts are relative to.
+LAMMPS_PREFIX=$(echo "$SIM_PATH" | sed 's|/afm/.*||; s|/sheetonsheet/.*||')
+if [ "$LAMMPS_PREFIX" = "$SIM_PATH" ]; then
+    # SIM_PATH starts with afm/ or sheetonsheet/ — no extra prefix.
+    LAMMPS_PREFIX=""
+    LAMMPS_SIM_PATH="$SIM_PATH"
+else
+    LAMMPS_SIM_PATH="${SIM_PATH#${LAMMPS_PREFIX}/}"
+fi
+
+{% if use_tmpdir %}
+SIM_ROOT=$(basename "$PBS_O_WORKDIR")
+# Per-task scratch root keeps concurrent array tasks isolated from each other.
+SCRATCH={{ scratch_dir }}/${SIM_ROOT}/task_${TASK_ID}
+
+# Shared inputs (build/, provenance/potentials/) may live at an ancestor of
+# SIM_PATH. Walk up to find the config-level root so every relative path the
+# LAMMPS scripts reference resolves under SCRATCH.
+COPY_ROOT="$SIM_PATH"
+search="$SIM_PATH"
+while [ "$search" != "." ] && [ "$search" != "/" ]; do
+    if [ -d "$PBS_O_WORKDIR/$search/provenance" ] || [ -d "$PBS_O_WORKDIR/$search/build" ]; then
+        COPY_ROOT="$search"
+        break
+    fi
+    search=$(dirname "$search")
+done
+
+mkdir -p "$SCRATCH/$COPY_ROOT"
+rsync -av --exclude='*.lammpstrj' --exclude='results/' --exclude='visuals/' "$PBS_O_WORKDIR/$COPY_ROOT/" "$SCRATCH/$COPY_ROOT/"
+mkdir -p "$SCRATCH/${SIM_PATH}/results" "$SCRATCH/${SIM_PATH}/visuals" "$SCRATCH/${SIM_PATH}/data"
+if [ -n "$LAMMPS_PREFIX" ]; then
+    cd "$SCRATCH/$LAMMPS_PREFIX"
+else
+    cd "$SCRATCH"
+fi
+{% else %}
+if [ -n "$LAMMPS_PREFIX" ]; then
+    cd "$PBS_O_WORKDIR/$LAMMPS_PREFIX"
+else
+    cd "$PBS_O_WORKDIR"
+fi
+{% endif %}
+
+# Phase 1: system initialisation (writes load_*N.data)
+{{ mpi_command }} lmp {{ lmp_flags }} -in ${LAMMPS_SIM_PATH}/lammps/system.in
+if [ $? -ne 0 ]; then
+    echo "Error: system.in failed for ${SIM_PATH}"
+    exit 1
+fi
+
+# Phase 2: slide simulation (reads load_*N.data, loops over forces)
+{{ mpi_command }} lmp {{ lmp_flags }} -in ${LAMMPS_SIM_PATH}/lammps/slide.in
+if [ $? -ne 0 ]; then
+    echo "Error: slide.in failed for ${SIM_PATH}"
+    exit 1
+fi
+
+{% if use_tmpdir %}
+mkdir -p "$PBS_O_WORKDIR/${SIM_PATH}"
+cp -r ${LAMMPS_SIM_PATH}/results ${LAMMPS_SIM_PATH}/visuals ${LAMMPS_SIM_PATH}/data "$PBS_O_WORKDIR/${SIM_PATH}/"
+cp ${LAMMPS_SIM_PATH}/load_*.data "$PBS_O_WORKDIR/${SIM_PATH}/" 2>/dev/null || true
+{% endif %}
+
+echo "Simulation completed successfully: ${SIM_PATH}"

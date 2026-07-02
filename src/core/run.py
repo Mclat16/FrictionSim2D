@@ -231,10 +231,54 @@ def _build_hpc_manifest_entries(
     return simulation_paths, configured_scripts
 
 
+def dispatch_hpc_generation(
+    generator: 'HPCScriptGenerator',
+    simulation_root: Path,
+    output_dir: Path,
+    scheduler: str,
+    base_dir: str,
+    manifest_entries: List[str],
+):
+    """Generate HPC scripts, choosing combined, two-phase, or single-phase layout.
+
+    AFM simulations have one system.in and one slide.in per simulation
+    directory. When both phases are present in equal numbers (1:1 per sim dir)
+    we emit a single combined job that runs system then slide sequentially —
+    no PBS dependency needed. When counts differ (unusual) we fall back to two
+    dependent array jobs. Sheet-on-sheet simulations have only slide scripts
+    and use a single array job.
+
+    Returns whatever the chosen generator method returns.
+    """
+    from ..hpc.manifest import JobManifest
+
+    manifest = JobManifest.from_simulation_directory(simulation_root)
+    if manifest.has_system_jobs():
+        system_jobs = manifest.get_system_jobs()
+        slide_jobs = manifest.get_slide_jobs()
+        if len(system_jobs) == len(slide_jobs):
+            logger.info(
+                "System+slide jobs detected (1:1) — generating combined HPC script."
+            )
+            return generator.generate_combined_scripts(
+                manifest, output_dir, scheduler=scheduler, base_dir=base_dir
+            )
+        logger.info("System/slide counts differ — generating two-phase HPC scripts.")
+        return generator.generate_two_phase_scripts(
+            manifest, output_dir, scheduler=scheduler, base_dir=base_dir
+        )
+    return generator.generate_scripts(
+        simulation_paths=manifest_entries,
+        output_dir=output_dir,
+        scheduler=scheduler,
+        base_dir=base_dir,
+    )
+
+
 def generate_hpc_scripts_for_root(simulation_root: Path, settings) -> None:
     """Generate shared HPC scripts for a simulation root directory."""
 
-    hpc_config = HPCConfig.from_settings(settings.hpc)
+    hpc_config = HPCConfig.from_settings(settings.hpc, job_name=simulation_root.name)
     # Skip only when required HPC settings were not provided.
     if not hpc_config.modules:
         logger.warning(
@@ -267,11 +311,13 @@ def generate_hpc_scripts_for_root(simulation_root: Path, settings) -> None:
     else:
         base_dir = '$SLURM_SUBMIT_DIR'
     generator = HPCScriptGenerator(hpc_config)
-    generator.generate_scripts(
-        simulation_paths=manifest_entries,
-        output_dir=hpc_dir,
-        scheduler=hpc_config.scheduler_type,
-        base_dir=base_dir
+    dispatch_hpc_generation(
+        generator,
+        simulation_root,
+        hpc_dir,
+        hpc_config.scheduler_type,
+        base_dir,
+        manifest_entries,
     )
 
 

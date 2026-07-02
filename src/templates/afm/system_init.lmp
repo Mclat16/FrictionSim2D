@@ -15,6 +15,9 @@ create_box      {{ ngroups }} box
 read_data       {{ sub_file }} add append group sub
 read_data       {{ tip_file }} add append shift {{ tip_x }} {{ tip_y }} {{ tip_z }} group tip offset {{ sub_natypes }} 0 0 0 0
 read_data       {{ sheet_file }} add append shift {{ sheet_shift_x }} {{ sheet_shift_y }} {{ sheet_z }} group 2D offset {{ offset_2d }} 0 0 0 0
+{% if flake_enabled %}
+read_data       {{ flake_file }} add append shift {{ flake_shift_x }} {{ flake_shift_y }} {{ flake_z }} group flake offset {{ offset_flake }} 0 0 0 0
+{% endif %}
 
 include         {{ potential_file }}
 
@@ -58,6 +61,16 @@ fix             nvt_sys system nvt temp {{ temp }} {{ temp }} $(100.0*dt)
 
 fix             sub_fix sub_fix setforce 0.0 0.0 0.0
 velocity        sub_fix set 0.0 0.0 0.0
+
+{% if flake_enabled %}
+# Hold the flake's corner atoms laterally so it keeps its shape while the tip
+# indents it. The xy keyword leaves the corners free to move in z (the tip
+# presses the flake down). This restraint exists only in the indentation
+# script; the sliding script reads the load state without it, so the flake is
+# free during friction measurement.
+group           flake_corner type {{ flake_corner_types }}
+fix             corner_hold flake_corner spring/self {{ flake_corner_k }} xy
+{% endif %}
 
 fix             tip_f {{ tip_fix_group }} rigid/nve single force * off off off torque * off off off
 run             10000

@@ -160,7 +160,7 @@ class HPCConfig:
             'use_tmpdir': self.use_tmpdir,
             'lammps_scripts': self.lammps_scripts,
             'select_multi': f"1:ncpus={self.cpus_per_node}:mem={self.memory_gb}gb:mpiprocs={self.cpus_per_node}",
-            'select_single': f"1:ncpus={self.cpus_per_node}:mem={self.memory_gb}gb",
+            'select_single': f"1:ncpus={self.cpus_per_node}:mem={self.memory_gb}gb:mpiprocs={self.cpus_per_node}",
             'ntasks_per_node': self.cpus_per_node,
             'cpus_per_task': 1,
             'mem': f"{self.memory_gb}G",
@@ -201,10 +201,35 @@ class HPCScriptGenerator:
     def _resolve_log_dir(self, base_dir: str) -> str:
         """Resolve log directory for job scripts.
 
-        Uses explicit config value when provided, otherwise falls back to
-        base_dir/logs to preserve current behavior.
+        Priority:
+        1. Explicit log_dir in config.
+        2. hpc_home/logs — a single shared directory for all jobs when hpc_home
+           is set (avoids per-sim-root log subdirectories).
+        3. base_dir/logs — fallback when no hpc_home (e.g. $PBS_O_WORKDIR/logs).
         """
-        return self.config.log_dir or f"{base_dir}/logs"
+        if self.config.log_dir:
+            return self.config.log_dir
+        if self.config.hpc_home:
+            return self.config.hpc_home.rstrip('/') + '/logs'
+        return f"{base_dir}/logs"
+
+    def _ensure_local_log_dir(self, output_dir: Path) -> None:
+        """Create the job log directory locally so it exists after transfer.
+
+        Schedulers open the ``-o``/``-e`` log files *before* the job script
+        runs, so an in-script ``mkdir`` is too late. The default log path is
+        ``<sim_root>/logs`` (relative to the submit dir), and the submit dir is
+        the parent of the ``hpc/`` output directory. Creating it here means the
+        empty ``logs/`` folder ships with the package via rsync and exists when
+        the job starts.
+        """
+        sim_root = Path(output_dir).parent
+        (sim_root / 'logs').mkdir(parents=True, exist_ok=True)
+        # If an explicit, submit-dir-relative log_dir was configured, create it
+        # too (skip absolute paths and shell-variable paths we cannot resolve).
+        log_dir = self.config.log_dir
+        if log_dir and not log_dir.startswith(('$', '/')):
+            (sim_root / log_dir).mkdir(parents=True, exist_ok=True)
 
     def _generate_array_scripts(self, simulation_paths: List[str], output_dir: Path,
                                 base_dir: str, scheduler: Literal['pbs', 'slurm']) -> List[Path]:
@@ -222,6 +247,7 @@ class HPCScriptGenerator:
         self._validate_config()
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_local_log_dir(output_dir)
 
         n_sims = len(simulation_paths)
         n_scripts = math.ceil(n_sims / self.config.max_array_size)
@@ -324,6 +350,98 @@ class HPCScriptGenerator:
         master_path.write_text('\n'.join(lines))
         return master_path
 
+    def generate_combined_scripts(self, manifest: 'JobManifest', output_dir: Path,
+                                   scheduler: Literal['pbs', 'slurm'] = 'pbs',
+                                   base_dir: Optional[str] = None) -> List[Path]:
+        """Generate a single combined system+slide script for AFM simulations.
+
+        Each array task runs system.in then slide.in sequentially within the
+        same job, eliminating the need for PBS job dependencies. Use when each
+        simulation directory has exactly one system script and one slide script.
+
+        Args:
+            manifest: JobManifest containing all jobs.
+            output_dir: Directory to write scripts.
+            scheduler: Scheduler type.
+            base_dir: Base directory variable (auto-detected if None).
+
+        Returns:
+            List containing the single generated script path.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_local_log_dir(output_dir)
+
+        base_dir = base_dir or ('$PBS_O_WORKDIR' if scheduler == 'pbs' else '$SLURM_SUBMIT_DIR')
+
+        system_jobs = manifest.get_system_jobs()
+        # One entry per unique simulation directory, preserving order.
+        seen: dict = {}
+        for j in system_jobs:
+            seen.setdefault(j.simulation_path, None)
+        sim_dirs = list(seen.keys())
+
+        manifest_name = 'manifest_combined.txt'
+        (output_dir / manifest_name).write_text('\n'.join(sim_dirs) + '\n', encoding='utf-8')
+
+        template_name = f"{scheduler}_combined.j2"
+        template = self.jinja_env.get_template(template_name)
+        script_ext = '.pbs' if scheduler == 'pbs' else '.sh'
+
+        context = self.config.to_dict()
+        context.update({
+            'array_size': len(sim_dirs),
+            'manifest_file': f"{base_dir}/hpc/{manifest_name}",
+            'manifest_filename': manifest_name,
+            'base_dir': base_dir,
+            'log_dir': self._resolve_log_dir(base_dir),
+        })
+
+        script_path = output_dir / f"run{script_ext}"
+        script_path.write_text(template.render(context))
+
+        self._write_combined_submission(output_dir, script_path, scheduler)
+        return [script_path]
+
+    def _write_combined_submission(self, output_dir: Path, script: Path,
+                                    scheduler: Literal['pbs', 'slurm']) -> Path:
+        """Write submission helper for a combined system+slide script.
+
+        Args:
+            output_dir: Directory to write script.
+            script: The combined script path.
+            scheduler: Scheduler type.
+
+        Returns:
+            Path to submission script.
+        """
+        submit_cmd = 'qsub' if scheduler == 'pbs' else 'sbatch'
+        sim_root = output_dir.parent
+        hpc_host = self.config.hpc_host or "<HPC_HOST>"
+        hpc_home = self.config.hpc_home or "<HPC_HOME>/"
+        rsync_target = f"{hpc_host}:{hpc_home}"
+        lines = [
+            '#!/bin/bash',
+            '# Combined system+slide submission (single job, no dependency needed)',
+            '',
+            '# Optional: upload to HPC',
+            f'# rsync -rvltoD {sim_root.name} {rsync_target}',
+            '',
+            f'cd {sim_root}',
+            '',
+            f'{submit_cmd} hpc/{script.name}',
+            '',
+            f'# Monitor with: {"qstat" if scheduler == "pbs" else "squeue"} -u $USER',
+            '',
+            '# Optional: download results after completion',
+            f'# rsync -avzhP --include="*/" --include="results/***"'
+            f' --include="visuals/***" --exclude="*" {rsync_target}{sim_root.name} ./',
+        ]
+        submit_path = output_dir / 'submit_jobs.sh'
+        submit_path.write_text('\n'.join(lines))
+        submit_path.chmod(0o755)
+        return submit_path
+
     def generate_scripts(self, simulation_paths: List[str], output_dir: Path,
                         scheduler: Literal['pbs', 'slurm'] = 'pbs',
                         **kwargs) -> List[Path]:
@@ -366,6 +484,7 @@ class HPCScriptGenerator:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_local_log_dir(output_dir)
 
         base_dir = base_dir or ('$PBS_O_WORKDIR' if scheduler == 'pbs' else '$SLURM_SUBMIT_DIR')
 
@@ -520,6 +639,10 @@ def create_hpc_package(simulation_dir: Path, output_dir: Path,
 
     shutil.copytree(simulation_dir, package_dir / 'simulations',
                     ignore=shutil.ignore_patterns('*.lammpstrj'))
+
+    # base_dir '../simulations' means logs resolve under the simulations tree;
+    # create it so the scheduler can open its log files at job start.
+    (package_dir / 'simulations' / 'logs').mkdir(parents=True, exist_ok=True)
 
     generator = HPCScriptGenerator(config)
     generator.generate_scripts(simulation_paths, package_dir / 'hpc',

@@ -33,6 +33,8 @@ class AFMSimulation(SimulationBase):
         self.sheet_paths: Dict[int, Path] = {}
         self.tip_path: Path
         self.sub_path: Path
+        self.flake_path: Optional[Path] = None
+        self.flake_dims: Dict[str, float] = {}
         self.z_positions: Dict[int, Dict[str, float]] = {}
         self.groups: Dict[int, Dict[str, str]] = {}
         self.pm: Dict[int, PotentialManager] = {}
@@ -105,11 +107,14 @@ class AFMSimulation(SimulationBase):
         prov_dir.mkdir(parents=True, exist_ok=True)
         logger.debug("Provenance folder initialized at: %s", prov_dir)
 
-        for component_name, config in [
+        provenance_components = [
             ('sheet', self.config.sheet),
             ('tip', self.config.tip),
-            ('sub', self.config.sub)
-        ]:
+            ('sub', self.config.sub),
+        ]
+        if self.config.flake is not None:
+            provenance_components.append(('flake', self.config.flake))
+        for component_name, config in provenance_components:
             self._add_component_files_to_provenance(component_name, config)
 
         logger.info("Initialized provenance folder: %s", prov_dir)
@@ -126,6 +131,12 @@ class AFMSimulation(SimulationBase):
             self.config.tip, build_dir, self.config.settings
         )
         logger.info("Built tip: %s", tip_path.name)
+
+        if self.config.flake is not None:
+            self.flake_path, self.flake_dims = components.build_flake_component(
+                self.config.flake, build_dir
+            )
+            logger.info("Built flake: %s", self.flake_path.name)
 
         sub_path = components.build_substrate(
             self.config.sub,
@@ -228,10 +239,6 @@ class AFMSimulation(SimulationBase):
         lat_c = self.lat_c
 
         gap_sub_sheet = pm.calculate_gap('sub', 'sheet', buffer=0.5)
-        gap_sheet_tip = pm.calculate_gap('sheet', 'tip', buffer=0.5)
-
-        logger.info("Calculated gaps: Sub-Sheet=%.2fA, Sheet-Tip=%.2fA",
-                    gap_sub_sheet, gap_sheet_tip)
 
         sub_thickness = self.config.sub.thickness
 
@@ -242,7 +249,30 @@ class AFMSimulation(SimulationBase):
 
         lat_c = (self.config.sheet.lat_c or 6.0) if lat_c is None else lat_c
         sheet_stack_height = (n_layers - 1) * lat_c
-        tip_z = sheet_base_z + sheet_stack_height + gap_sheet_tip + tip_radius
+        sheet_top_z = sheet_base_z + sheet_stack_height
+
+        if self.config.flake is not None:
+            # Flake sits above the top sheet; the tip then sits above the flake.
+            gap_sheet_flake = pm.calculate_gap('sheet', 'flake', buffer=0.5)
+            gap_flake_tip = pm.calculate_gap('flake', 'tip', buffer=0.5)
+            flake_z = sheet_top_z + gap_sheet_flake
+            self.z_positions[n_layers]['flake'] = flake_z
+            # Physical flake thickness (strip the ±1 Å z-padding build_flake adds).
+            flake_thickness = max(
+                0.0,
+                (self.flake_dims.get('zhi', 0.0) - self.flake_dims.get('zlo', 0.0)) - 2.0,
+            )
+            tip_z = flake_z + flake_thickness + gap_flake_tip + tip_radius
+            logger.info(
+                "Calculated gaps: Sub-Sheet=%.2fA, Sheet-Flake=%.2fA, Flake-Tip=%.2fA",
+                gap_sub_sheet, gap_sheet_flake, gap_flake_tip,
+            )
+        else:
+            gap_sheet_tip = pm.calculate_gap('sheet', 'tip', buffer=0.5)
+            tip_z = sheet_top_z + gap_sheet_tip + tip_radius
+            logger.info("Calculated gaps: Sub-Sheet=%.2fA, Sheet-Tip=%.2fA",
+                        gap_sub_sheet, gap_sheet_tip)
+
         self.z_positions[n_layers]['tip'] = tip_z
 
     def _generate_potentials(
@@ -279,6 +309,13 @@ class AFMSimulation(SimulationBase):
             regions=sheet_edge_regions,
         )
 
+        flake_cfg = self.config.flake
+        has_flake = flake_cfg is not None
+        if flake_cfg is not None:
+            # regions=[None, 'corner'] interleaves core/corner types to match the
+            # type splitting done by components.apply_flake_corner_types.
+            pm.register_component('flake', flake_cfg, regions=[None, 'corner'])
+
         if self.config.settings.simulation.drive_method == 'virtual_atom':
             pm.register_virtual_atom()
 
@@ -290,6 +327,12 @@ class AFMSimulation(SimulationBase):
         pm.add_cross_interaction('sub', 'sheet')
         pm.add_cross_interaction('tip', 'sheet')
 
+        if has_flake:
+            pm.add_self_interaction('flake')
+            pm.add_cross_interaction('sub', 'flake')
+            pm.add_cross_interaction('tip', 'flake')
+            pm.add_cross_interaction('sheet', 'flake')
+
         if sheet_needs_layer_types and n_sheet_layers > 1:
             pm.add_interlayer_interaction('sheet')
 
@@ -300,6 +343,11 @@ class AFMSimulation(SimulationBase):
         self.groups[n_sheet_layers]['sub_types'] = pm.types.get_group_string('sub')
         self.groups[n_sheet_layers]['tip_types'] = pm.types.get_group_string('tip')
         self.groups[n_sheet_layers]['sheet_types'] = pm.types.get_group_string('sheet')
+
+        if has_flake:
+            self.groups[n_sheet_layers]['flake_types'] = pm.types.get_group_string('flake')
+            corner_ids = pm.types.ids_by_component_region('flake', 'corner')
+            self.groups[n_sheet_layers]['flake_corner_types'] = ' '.join(map(str, corner_ids))
 
         if sheet_needs_layer_types:
             for layer in range(n_sheet_layers):
@@ -363,6 +411,39 @@ class AFMSimulation(SimulationBase):
         tip_natypes = len(groups['tip_types'].split())
         offset_2d = sub_natypes + tip_natypes
 
+        # Flake placement (centered under the tip in xy, above the sheet in z).
+        flake_cfg = self.config.flake
+        flake_enabled = flake_cfg is not None
+        flake_ctx: Dict[str, object] = {'flake_enabled': flake_enabled}
+        if flake_cfg is not None and self.flake_path is not None:
+            sheet_natypes = len(groups['sheet_types'].split())
+            flake_center_x = (self.flake_dims['xlo'] + self.flake_dims['xhi']) / 2.0
+            flake_center_y = (self.flake_dims['ylo'] + self.flake_dims['yhi']) / 2.0
+            flake_ctx.update({
+                'flake_file': f"{self.relative_run_dir}/build/{self.flake_path.name}",
+                'flake_shift_x': tip_x - flake_center_x,
+                'flake_shift_y': tip_y - flake_center_y,
+                'flake_z': z_positions['flake'],
+                'offset_flake': offset_2d + sheet_natypes,
+                'flake_types': groups['flake_types'],
+                'flake_corner_types': groups['flake_corner_types'],
+                'flake_corner_k': flake_cfg.corner_spring_k,
+            })
+
+        # Tip viscous damping: an explicit dspring (including 0.0) overrides; otherwise the
+        # viscous coefficient is auto-computed in the LAMMPS script from damping_ratio, the
+        # driving spring constant, and the actual tip mass/atom count (see slide template).
+        if self.config.tip.dspring is not None:
+            damp_ev = self.config.tip.dspring / 0.016
+            damping_ratio = None
+        else:
+            damp_ev = None
+            damping_ratio = (
+                self.config.tip.damping_ratio
+                if self.config.tip.damping_ratio is not None
+                else 0.1
+            )
+
         context = {
             'temp': self.config.general.temp,
             'forces': self.config.general.force,
@@ -408,7 +489,8 @@ class AFMSimulation(SimulationBase):
             'neigh_modify_command': sim.neigh_modify_command,
             'run_steps': sim.slide_run_steps,
             'drive_method': sim.drive_method,
-            'damp_ev': self.config.tip.dspring / 0.016,
+            'damp_ev': damp_ev,
+            'damping_ratio': damping_ratio,
             'spring_ev': (self.config.general.driving_spring or 8.0) / 16.02,
             'virtual_offset': self.config.tip.r * 1.5, 
             'results_freq': out.results_frequency,
@@ -432,6 +514,7 @@ class AFMSimulation(SimulationBase):
             'finite_sheet_edge_width': self.config.settings.geometry.finite_sheet_edge_width,
             'finite_sheet_edge_spring_k': self.config.settings.geometry.finite_sheet_edge_spring_k,
         }
+        context.update(flake_ctx)
 
         init_script = self.render_template("afm/system_init.lmp", context)
         self.write_file("lammps/system.in", init_script, self.output_dir_layer[n_layers])

@@ -11,7 +11,12 @@ from typing import List, Optional, NoReturn
 import click
 
 from .core.config import load_settings, settings_origin, _global_settings_path
-from .core.run import run_simulations, _build_hpc_manifest_entries, layer_aware_path_sort_key
+from .core.run import (
+    run_simulations,
+    _build_hpc_manifest_entries,
+    dispatch_hpc_generation,
+    layer_aware_path_sort_key,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -355,18 +360,28 @@ def hpc_generate(simulation_dir: str, settings_file: Optional[Path],
 
     generator = HPCScriptGenerator(hpc_config)
     base_dir = '$PBS_O_WORKDIR' if scheduler == 'pbs' else '$SLURM_SUBMIT_DIR'
-    scripts = generator.generate_scripts(
-        simulation_paths=manifest_entries,
-        output_dir=out_dir,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        base_dir=base_dir
+    result = dispatch_hpc_generation(
+        generator,
+        sim_dir,
+        out_dir,
+        scheduler,
+        base_dir,
+        manifest_entries,
     )
 
-    click.echo(f"✅ Generated {len(scripts)} script(s) in {out_dir}")
+    if isinstance(result, dict):
+        n_scripts = sum(len(v) for v in result.values())
+        submit_file = 'submit_jobs.sh'
+        click.echo(f"✅ Generated {n_scripts} two-phase script(s) in {out_dir}")
+        click.echo("   (system → slide; slide jobs wait for system jobs to finish)")
+    else:
+        n_scripts = len(result)
+        submit_file = 'submit_all.txt'
+        click.echo(f"✅ Generated {n_scripts} script(s) in {out_dir}")
     click.echo("\n📝 Next steps:")
     click.echo(f"   1. Review scripts in {out_dir}")
     click.echo("   2. Transfer to HPC cluster")
-    click.echo("   3. Follow submit_all.txt")
+    click.echo(f"   3. Follow {submit_file}")
 
 # =============================================================================
 # AIIDA COMMANDS (Optional)

@@ -33,13 +33,24 @@ TASK_ID=${SLURM_ARRAY_TASK_ID}
 TASK_ID=1
 {% endif %}
 
-SCRIPT_PATH=$(sed -n "${TASK_ID}p" $SLURM_SUBMIT_DIR/hpc/{{ manifest_filename }})
-SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
-SIM_PATH=$(dirname "$SCRIPT_DIR")
+SIM_PATH=$(sed -n "${TASK_ID}p" $SLURM_SUBMIT_DIR/hpc/{{ manifest_filename }})
 
-if [ -z "$SCRIPT_PATH" ]; then
-    echo "Error: No script path for index ${TASK_ID}"
+if [ -z "$SIM_PATH" ]; then
+    echo "Error: No simulation path for index ${TASK_ID}"
     exit 1
+fi
+
+# Strip any sim-root prefix that sits above afm/ or sheetonsheet/ (e.g. the
+# K50_zeta0p1/ directory in a multi-sim array job). LAMMPS must be run from
+# the directory that contains afm/ because that is what the relative paths
+# inside the generated LAMMPS scripts are relative to.
+LAMMPS_PREFIX=$(echo "$SIM_PATH" | sed 's|/afm/.*||; s|/sheetonsheet/.*||')
+if [ "$LAMMPS_PREFIX" = "$SIM_PATH" ]; then
+    # SIM_PATH starts with afm/ or sheetonsheet/ — no extra prefix.
+    LAMMPS_PREFIX=""
+    LAMMPS_SIM_PATH="$SIM_PATH"
+else
+    LAMMPS_SIM_PATH="${SIM_PATH#${LAMMPS_PREFIX}/}"
 fi
 
 {% if use_tmpdir %}
@@ -47,10 +58,9 @@ SIM_ROOT=$(basename "$SLURM_SUBMIT_DIR")
 # Per-task scratch root keeps concurrent array tasks isolated from each other.
 SCRATCH={{ scratch_dir }}/${SIM_ROOT}/task_${TASK_ID}
 
-# Shared inputs (build/, provenance/potentials/) live at the simulation's
-# config level, which may be an ancestor of SIM_PATH (e.g. AFM layer dirs share
-# one provenance/ folder). Walk up to find it and copy that whole subtree so
-# every relative path the LAMMPS script references resolves under SCRATCH.
+# Shared inputs (build/, provenance/potentials/) may live at an ancestor of
+# SIM_PATH. Walk up to find the config-level root so every relative path the
+# LAMMPS scripts reference resolves under SCRATCH.
 COPY_ROOT="$SIM_PATH"
 search="$SIM_PATH"
 while [ "$search" != "." ] && [ "$search" != "/" ]; do
@@ -64,22 +74,37 @@ done
 mkdir -p "$SCRATCH/$COPY_ROOT"
 rsync -av --exclude='*.lammpstrj' --exclude='results/' --exclude='visuals/' "$SLURM_SUBMIT_DIR/$COPY_ROOT/" "$SCRATCH/$COPY_ROOT/"
 mkdir -p "$SCRATCH/${SIM_PATH}/results" "$SCRATCH/${SIM_PATH}/visuals" "$SCRATCH/${SIM_PATH}/data"
-cd $SCRATCH
+if [ -n "$LAMMPS_PREFIX" ]; then
+    cd "$SCRATCH/$LAMMPS_PREFIX"
+else
+    cd "$SCRATCH"
+fi
 {% else %}
-cd $SLURM_SUBMIT_DIR
+if [ -n "$LAMMPS_PREFIX" ]; then
+    cd "$SLURM_SUBMIT_DIR/$LAMMPS_PREFIX"
+else
+    cd "$SLURM_SUBMIT_DIR"
+fi
 {% endif %}
 
-{{ mpi_command }} lmp {{ lmp_flags }} -in ${SCRIPT_PATH}
+# Phase 1: system initialisation (writes load_*N.data)
+{{ mpi_command }} lmp {{ lmp_flags }} -in ${LAMMPS_SIM_PATH}/lammps/system.in
 if [ $? -ne 0 ]; then
-    echo "Error: LAMMPS failed on ${SCRIPT_PATH}"
+    echo "Error: system.in failed for ${SIM_PATH}"
+    exit 1
+fi
+
+# Phase 2: slide simulation (reads load_*N.data, loops over forces)
+{{ mpi_command }} lmp {{ lmp_flags }} -in ${LAMMPS_SIM_PATH}/lammps/slide.in
+if [ $? -ne 0 ]; then
+    echo "Error: slide.in failed for ${SIM_PATH}"
     exit 1
 fi
 
 {% if use_tmpdir %}
 mkdir -p "$SLURM_SUBMIT_DIR/${SIM_PATH}"
-cp -r ${SIM_PATH}/results ${SIM_PATH}/visuals ${SIM_PATH}/data "$SLURM_SUBMIT_DIR/${SIM_PATH}/"
-# Persist indentation load states so a dependent slide phase (AFM) can read them.
-cp ${SIM_PATH}/load_*.data "$SLURM_SUBMIT_DIR/${SIM_PATH}/" 2>/dev/null || true
+cp -r ${LAMMPS_SIM_PATH}/results ${LAMMPS_SIM_PATH}/visuals ${LAMMPS_SIM_PATH}/data "$SLURM_SUBMIT_DIR/${SIM_PATH}/"
+cp ${LAMMPS_SIM_PATH}/load_*.data "$SLURM_SUBMIT_DIR/${SIM_PATH}/" 2>/dev/null || true
 {% endif %}
 
 echo "Simulation completed successfully: ${SIM_PATH}"

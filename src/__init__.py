@@ -10,6 +10,7 @@ __version__ = "0.2.0"
 
 import logging
 from importlib.util import find_spec
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -28,6 +29,12 @@ if TYPE_CHECKING:
 _AIIDA_AVAILABLE = find_spec('aiida') is not None
 
 logger = logging.getLogger(__name__)
+
+
+def _default_settings_file() -> str | None:
+    """Return a local settings.yaml path when one exists in the current directory."""
+    candidate = Path.cwd() / "settings.yaml"
+    return str(candidate) if candidate.is_file() else None
 
 
 def __getattr__(name: str):
@@ -71,43 +78,47 @@ def __getattr__(name: str):
 
 
 def afm(config_file: str = "afm_config.ini", output_root: str = ".",
-    generate_hpc: bool = False):
+    generate_hpc: bool = False, settings_file: str | None = None):
     """Run AFM simulations from config file.
 
     Args:
         config_file: Path to .ini configuration file.
         output_root: Base directory for the simulation root folder.
+        settings_file: Path to settings.yaml; falls back to ./settings.yaml if present.
     """
     _run_all(config_file, model="afm", output_root=output_root,
-             generate_hpc=generate_hpc)
+             generate_hpc=generate_hpc, settings_file=settings_file)
 
 
 def sheetonsheet(config_file: str = "sheet_config.ini", output_root: str = ".",
-                 generate_hpc: bool = False):
+                 generate_hpc: bool = False, settings_file: str | None = None):
     """Run sheet-on-sheet simulations from config file.
 
     Args:
         config_file: Path to .ini configuration file.
         output_root: Base directory for the simulation root folder.
+        settings_file: Path to settings.yaml; falls back to ./settings.yaml if present.
     """
     _run_all(config_file, model="sheetonsheet", output_root=output_root,
-             generate_hpc=generate_hpc)
+             generate_hpc=generate_hpc, settings_file=settings_file)
 
 
 def _run_all(config_file: str, model: str = "afm", output_root: str = ".",
-             generate_hpc: bool = False):
+             generate_hpc: bool = False, settings_file: str | None = None):
     """Run all simulations defined in config file.
 
     Args:
         config_file: Path to .ini config file.
         model: Simulation type ('afm' or 'sheetonsheet').
         output_root: Base directory for the simulation root folder.
+        settings_file: Path to settings.yaml; falls back to ./settings.yaml if present.
     """
     from .core.run import run_simulations
 
     created_simulations, simulation_root, configs_to_run, _ = run_simulations(
         config_file=config_file,
         model=model,
+        settings_file=settings_file or _default_settings_file(),
         output_root=output_root,
         generate_hpc=generate_hpc,
     )

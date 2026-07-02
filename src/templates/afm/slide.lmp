@@ -100,7 +100,14 @@ variable        fy_spr equal f_spr[2]*{{ ev_a_to_nn }}
 
 fix             fc_ave all ave/time 1 1000 {{ results_freq }} v_fz_tip v_fx_spr v_fy_spr v_comx v_comy v_comz v_comx_tip v_comy_tip v_comz_tip file {{ results_file_pattern }}
 
+{% if damp_ev is not none %}
 fix             damp {{ tip_fix_group }} viscous {{ damp_ev }}
+{% else %}
+# Viscous damping auto-set to zeta = {{ damping_ratio }} of critical for the driven tip.
+# critical per-atom gamma = 2*sqrt(K*M)/(N*sqrt(ftm2v)); K = spring const (eV/A^2),
+# M = mass({{ tip_fix_group }}), N = count({{ tip_fix_group }}), ftm2v = 9648.5009 (metal units).
+fix             damp {{ tip_fix_group }} viscous $({{ damping_ratio }}*2.0*sqrt({{ spring_ev }}*mass({{ tip_fix_group }}))/(count({{ tip_fix_group }})*sqrt(9648.5009)))
+{% endif %}
 
 variable        spring_x equal cos(v_a*PI/180)
 variable        spring_y equal sin(v_a*PI/180)

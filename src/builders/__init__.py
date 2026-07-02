@@ -1,18 +1,20 @@
 """Simulation builders for FrictionSim2D.
 
-This package contains the high-level builders that orchestrate
-the construction of complete simulation setups:
-- AFMSimulation: AFM tip-on-sheet friction simulations
-- SheetOnSheetSimulation: Sheet-on-sheet friction simulations
-- Component builders (tip, sheet, substrate)
+This package exposes high-level builders and component helpers via lazy
+attribute loading to avoid circular imports during startup.
 """
 
-from . import components
-from .afm import AFMSimulation
-from .sheetonsheet import SheetOnSheetSimulation
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    "AFMSimulation",
-    "SheetOnSheetSimulation",
-    "components",
-]
+__all__ = ["AFMSimulation", "SheetOnSheetSimulation", "components"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "AFMSimulation":
+        return import_module(".afm", __name__).AFMSimulation
+    if name == "SheetOnSheetSimulation":
+        return import_module(".sheetonsheet", __name__).SheetOnSheetSimulation
+    if name == "components":
+        return import_module(".components", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

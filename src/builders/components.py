@@ -19,13 +19,17 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, cast
 from importlib import resources
+import re
+import math
 import subprocess
 import numpy as np
 
 from ase import io as ase_io
 from jinja2 import Environment
 
-from ..core.config import GlobalSettings, SheetConfig, SubstrateConfig, TipConfig, ComponentConfig
+from ..core.config import (
+    GlobalSettings, SheetConfig, SubstrateConfig, TipConfig, ComponentConfig, FlakeConfig
+)
 from ..core.potential_manager import PotentialManager
 from ..core.utils import (
     cifread, get_material_path, get_model_dimensions,
@@ -43,6 +47,541 @@ def _create_lammps_instance():
     from lammps import lammps  # pylint: disable=import-outside-toplevel
 
     return lammps(cmdargs=["-log", "none", "-screen", "none", "-nocite"])
+
+
+# =============================================================================
+# Flake Geometry and Building
+# =============================================================================
+
+def _require_box_dims(
+    dims: Dict[str, Optional[float]],
+    *,
+    context: str,
+) -> Dict[str, float]:
+    """Validate and narrow parsed box dimensions to floats.
+
+    Args:
+        dims: Mapping returned by get_model_dimensions.
+        context: Text included in ValueError when a key is missing.
+
+    Returns:
+        Dictionary with fully-typed float values for x/y/z bounds.
+    """
+    keys = ("xlo", "xhi", "ylo", "yhi", "zlo", "zhi")
+    missing = [k for k in keys if dims.get(k) is None]
+    if missing:
+        raise ValueError(f"Could not parse box dimensions ({missing}) from {context}")
+    out: Dict[str, float] = {}
+    for key in keys:
+        value = dims[key]
+        if value is None:
+            raise ValueError(f"Missing required box dimension '{key}' in {context}")
+        out[key] = float(value)
+    return out
+
+
+def _parse_lmp_atoms(
+    lmp_path: Path,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Parse atom types and Cartesian positions from a LAMMPS data file.
+
+    Supports both 'atomic' and 'charge' atom styles (auto-detected from the
+    ``Atoms`` header comment).
+
+    Returns:
+        Tuple of (types, xs, ys, zs) numpy arrays, or None if no atoms found.
+    """
+    lines = lmp_path.read_text(encoding='utf-8').splitlines()
+
+    atom_style = 'atomic'
+    atoms_start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*Atoms\s*(#|$)', line):
+            if 'charge' in line.lower():
+                atom_style = 'charge'
+            atoms_start = i + 2
+            break
+    if atoms_start is None:
+        return None
+
+    types: List[int] = []
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+
+    for line in lines[atoms_start:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            if types:
+                break
+            continue
+        parts = stripped.split()
+        try:
+            if atom_style == 'charge':
+                t = int(parts[1])
+                x, y, z = float(parts[3]), float(parts[4]), float(parts[5])
+            else:
+                t = int(parts[1])
+                x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+            types.append(t)
+            xs.append(x)
+            ys.append(y)
+            zs.append(z)
+        except (ValueError, IndexError):
+            break
+
+    if not types:
+        return None
+    return np.array(types), np.array(xs), np.array(ys), np.array(zs)
+
+
+def _in_equilateral_triangle(
+    x: float,
+    y: float,
+    edge_length: float,
+    center: Tuple[float, float] = (0.0, 0.0),
+) -> bool:
+    """Check if point (x, y) is inside an equilateral triangle (apex pointing up)."""
+    cx, cy = center
+    x_rel = x - cx
+    y_rel = y - cy
+
+    height = edge_length * math.sqrt(3) / 2.0
+    half_base = edge_length / 2.0
+
+    y_apex = height / 3.0
+    y_base = -2.0 * height / 3.0
+
+    if y_rel < y_base or y_rel > y_apex:
+        return False
+
+    left_bound = -half_base * (1.0 - (y_rel - y_base) / height)
+    right_bound = half_base * (1.0 - (y_rel - y_base) / height)
+
+    return left_bound <= x_rel <= right_bound
+
+
+def _in_square(
+    x: float,
+    y: float,
+    edge_length: float,
+    center: Tuple[float, float] = (0.0, 0.0),
+    rotation_deg: float = 0.0,
+) -> bool:
+    """Check if point (x, y) is inside a (optionally rotated) square."""
+    cx, cy = center
+    x_rel = x - cx
+    y_rel = y - cy
+
+    if rotation_deg != 0.0:
+        angle_rad = math.radians(-rotation_deg)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        x_rot = cos_a * x_rel - sin_a * y_rel
+        y_rot = sin_a * x_rel + cos_a * y_rel
+    else:
+        x_rot, y_rot = x_rel, y_rel
+
+    half = edge_length / 2.0
+    return -half <= x_rot <= half and -half <= y_rot <= half
+
+
+def _in_hexagon(
+    x: float,
+    y: float,
+    edge_length: float,
+    center: Tuple[float, float] = (0.0, 0.0),
+    rotation_deg: float = 0.0,
+) -> bool:
+    """Check if point (x, y) is inside a (optionally rotated) regular hexagon.
+
+    ``edge_length`` is the distance from the center to a vertex (circumradius).
+    """
+    cx, cy = center
+    x_rel = x - cx
+    y_rel = y - cy
+
+    if rotation_deg != 0.0:
+        angle_rad = math.radians(-rotation_deg)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        x_rot = cos_a * x_rel - sin_a * y_rel
+        y_rot = sin_a * x_rel + cos_a * y_rel
+    else:
+        x_rot, y_rot = x_rel, y_rel
+
+    apothem = edge_length * math.sqrt(3) / 2.0
+
+    thresholds = [
+        abs(y_rot) <= apothem,
+        abs(x_rot) <= edge_length,
+        abs(x_rot / 2.0 + math.sqrt(3) * y_rot / 2.0) <= apothem,
+        abs(x_rot / 2.0 - math.sqrt(3) * y_rot / 2.0) <= apothem,
+    ]
+
+    return all(thresholds)
+
+
+def build_flake(
+    base_lmp_path: Path,
+    output_path: Path,
+    shape: str = "triangle",
+    edge_length: float = 40.0,
+    rotation_deg: float = 0.0,
+    center_xy: Optional[Tuple[float, float]] = None,
+) -> Path:
+    """Extract a natural-shaped flake from a supercell LAMMPS file.
+
+    Creates a finite patch (triangle/square/hexagon) by selecting atoms within
+    the shape boundary and writing them to a new LAMMPS data file. The flake is
+    centered at the box center (or ``center_xy``) and can be rotated.
+
+    Args:
+        base_lmp_path: Path to source LAMMPS data file (single layer).
+        output_path: Path for output flake file.
+        shape: Flake shape ('triangle', 'square', 'hexagon').
+        edge_length: Characteristic edge length (Å). For triangle/square: side;
+            for hexagon: circumradius (vertex distance from center).
+        rotation_deg: Rotation angle (degrees, counter-clockwise).
+        center_xy: Override flake center (default: box center).
+
+    Returns:
+        Path to the output flake file.
+
+    Raises:
+        ValueError: If shape is not recognized or if base file has no atoms.
+    """
+    shape_lower = shape.lower()
+    if shape_lower not in ("triangle", "square", "hexagon"):
+        raise ValueError(
+            f"Unknown flake shape: {shape}. Choose from: triangle, square, hexagon."
+        )
+
+    dims = _require_box_dims(get_model_dimensions(base_lmp_path), context=str(base_lmp_path))
+    xlo, xhi = dims["xlo"], dims["xhi"]
+    ylo, yhi = dims["ylo"], dims["yhi"]
+
+    if center_xy is None:
+        cx, cy = 0.5 * (xlo + xhi), 0.5 * (ylo + yhi)
+    else:
+        cx, cy = center_xy
+
+    parsed = _parse_lmp_atoms(base_lmp_path)
+    if parsed is None or len(parsed[0]) == 0:
+        raise ValueError(f"No atoms found in {base_lmp_path}")
+
+    types, xs, ys, zs = parsed
+    natoms = len(types)
+
+    boundary_check = {
+        "triangle": lambda x, y: _in_equilateral_triangle(x, y, edge_length, (cx, cy)),
+        "square": lambda x, y: _in_square(x, y, edge_length, (cx, cy), rotation_deg),
+        "hexagon": lambda x, y: _in_hexagon(x, y, edge_length, (cx, cy), rotation_deg),
+    }[shape_lower]
+
+    mask = np.array([boundary_check(xs[i], ys[i]) for i in range(natoms)], dtype=bool)
+    if not mask.any():
+        raise ValueError(
+            f"No atoms fell within the {shape_lower} flake boundary "
+            f"(edge_length={edge_length:.1f} Å). Is the supercell large enough?"
+        )
+
+    selected_indices = np.where(mask)[0]
+    lines = base_lmp_path.read_text(encoding="utf-8").splitlines()
+
+    atom_style = "atomic"
+    atoms_start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*Atoms\s*(#|$)", line):
+            if "charge" in line.lower():
+                atom_style = "charge"
+            atoms_start = i + 2
+            break
+    if atoms_start is None:
+        raise ValueError(f"Could not find Atoms section in {base_lmp_path}")
+
+    atom_lines: List[str] = []
+    new_id = 1
+    for idx in selected_indices:
+        raw_line = lines[atoms_start + idx]
+        parts = raw_line.strip().split()
+        if not parts or not parts[0].isdigit():
+            raise ValueError(
+                f"Malformed Atoms entry while building flake at line "
+                f"{atoms_start + idx + 1}: '{raw_line}'"
+            )
+        parts[0] = str(new_id)
+        atom_lines.append("  ".join(parts))
+        new_id += 1
+
+    selected_z = zs[selected_indices]
+    z_min, z_max = float(np.min(selected_z)), float(np.max(selected_z))
+    num_types = int(np.max(types[selected_indices]))
+
+    output_lines: List[str] = []
+    output_lines.append(f"Flake ({shape_lower}, edge={edge_length:.1f} A)")
+    output_lines.append("")
+    output_lines.append(f"{len(selected_indices)} atoms")
+    output_lines.append("0 bonds")
+    output_lines.append("0 angles")
+    output_lines.append("0 dihedrals")
+    output_lines.append("")
+    output_lines.append(f"{num_types} atom types")
+    output_lines.append("")
+    output_lines.append(f"{xlo:.6f} {xhi:.6f} xlo xhi")
+    output_lines.append(f"{ylo:.6f} {yhi:.6f} ylo yhi")
+    output_lines.append(f"{z_min - 1.0:.6f} {z_max + 1.0:.6f} zlo zhi")
+    output_lines.append("")
+
+    # Copy the Masses section verbatim from the source file.
+    masses_section: List[str] = []
+    in_masses = False
+    seen_mass_values = False
+    for line in lines:
+        if line.strip() == "Masses":
+            in_masses = True
+            masses_section.append(line)
+            continue
+        if in_masses:
+            if not line.strip() and not seen_mass_values:
+                masses_section.append(line)
+                continue
+            if not line.strip() and seen_mass_values:
+                masses_section.append(line)
+                break
+            if line.strip() and line.strip()[0].isalpha():
+                break
+            seen_mass_values = True
+            masses_section.append(line)
+
+    if masses_section:
+        output_lines.extend(masses_section)
+        output_lines.append("")
+
+    output_lines.append(f"Atoms # {atom_style}")
+    output_lines.append("")
+    output_lines.extend(atom_lines)
+    output_lines.append("")
+
+    output_path.write_text("\n".join(output_lines), encoding="utf-8")
+    logger.info(
+        "[flake] Created %s flake at (%.1f, %.1f) with %d atoms",
+        shape_lower, cx, cy, len(selected_indices),
+    )
+
+    return output_path
+
+
+_SHAPE_N_VERTICES = {"triangle": 3, "square": 4, "hexagon": 6}
+
+
+def _detect_corner_atom_indices(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    n_vertices: int,
+    corner_radius: float,
+) -> np.ndarray:
+    """Identify the atom indices that sit at the polygon's corners.
+
+    Robust to shape orientation/rotation: the flake centroid is computed, atoms
+    are sorted into ``n_vertices`` angular sectors aligned with the farthest
+    atom, the farthest atom in each sector is taken as the vertex, and every
+    atom within ``corner_radius`` of any vertex is flagged as a corner atom.
+
+    Args:
+        xs, ys: Atom coordinates.
+        n_vertices: Number of polygon corners (3, 4 or 6).
+        corner_radius: Capture radius (Å) around each vertex.
+
+    Returns:
+        Sorted numpy array of corner atom indices.
+    """
+    cx, cy = float(np.mean(xs)), float(np.mean(ys))
+    dx = xs - cx
+    dy = ys - cy
+    r = np.hypot(dx, dy)
+    theta = np.arctan2(dy, dx)
+
+    # Align sector boundaries so one sector is centered on the farthest atom.
+    theta0 = float(theta[int(np.argmax(r))])
+    sector = 2.0 * math.pi / n_vertices
+
+    corner_mask = np.zeros(len(xs), dtype=bool)
+    for k in range(n_vertices):
+        center_angle = theta0 + k * sector
+        # Wrap angular difference into [-pi, pi].
+        d_angle = np.angle(np.exp(1j * (theta - center_angle)))
+        in_sector = np.abs(d_angle) <= sector / 2.0
+        if not in_sector.any():
+            continue
+        sector_idx = np.where(in_sector)[0]
+        vertex_idx = sector_idx[int(np.argmax(r[sector_idx]))]
+        vx, vy = xs[vertex_idx], ys[vertex_idx]
+        near_vertex = np.hypot(xs - vx, ys - vy) <= corner_radius
+        corner_mask |= near_vertex
+
+    return np.where(corner_mask)[0]
+
+
+def apply_flake_corner_types(
+    flake_path: Path,
+    shape: str,
+    corner_radius: float,
+) -> Path:
+    """Re-type the flake's corner atoms into distinct LAMMPS atom types.
+
+    Mirrors :func:`apply_sheet_edge_types`: every original type ``t`` is split
+    into an interleaved core type ``2t-1`` and corner type ``2t`` so the result
+    matches ``PotentialManager.register_component(..., regions=[None, 'corner'])``.
+    The corner atoms can then be selected in LAMMPS via ``group ... type``.
+
+    The flake data file is modified in-place. Returns the same path.
+
+    Args:
+        flake_path: LAMMPS data file produced by :func:`build_flake`.
+        shape: Flake shape ('triangle', 'square', 'hexagon') — sets vertex count.
+        corner_radius: Capture radius (Å) around each detected vertex.
+
+    Raises:
+        ValueError: If the shape is unknown or the file has no atoms.
+    """
+    shape_lower = shape.lower()
+    if shape_lower not in _SHAPE_N_VERTICES:
+        raise ValueError(
+            f"Unknown flake shape: {shape}. Choose from: triangle, square, hexagon."
+        )
+    n_vertices = _SHAPE_N_VERTICES[shape_lower]
+
+    parsed = _parse_lmp_atoms(flake_path)
+    if parsed is None or len(parsed[0]) == 0:
+        raise ValueError(f"No atoms found in {flake_path}")
+    types, xs, ys, _zs = parsed
+
+    corner_indices = set(
+        int(i) for i in _detect_corner_atom_indices(xs, ys, n_vertices, corner_radius)
+    )
+    logger.info(
+        "[flake] Marked %d corner atoms (of %d) for %s flake",
+        len(corner_indices), len(types), shape_lower,
+    )
+
+    lines = flake_path.read_text(encoding="utf-8").splitlines()
+
+    # Locate sections.
+    atoms_start: Optional[int] = None
+    masses_start: Optional[int] = None
+    for i, line in enumerate(lines):
+        if line.strip() == "Masses":
+            masses_start = i
+        if re.match(r"^\s*Atoms\s*(#|$)", line):
+            atoms_start = i + 2
+            break
+    if atoms_start is None:
+        raise ValueError(f"Could not find Atoms section in {flake_path}")
+
+    num_types = int(np.max(types))
+
+    # Rewrite the atom type column: core -> 2t-1, corner -> 2t.
+    atom_seq = 0
+    for li in range(atoms_start, len(lines)):
+        stripped = lines[li].strip()
+        if not stripped or stripped.startswith("#"):
+            if atom_seq > 0:
+                break
+            continue
+        parts = stripped.split()
+        if not parts[0].isdigit():
+            break
+        old_type = int(parts[1])
+        is_corner = atom_seq in corner_indices
+        parts[1] = str(2 * old_type if is_corner else 2 * old_type - 1)
+        lines[li] = "  ".join(parts)
+        atom_seq += 1
+
+    # Update the atom-types header.
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*\d+\s+atom types\s*$", line.strip()):
+            lines[i] = f"{2 * num_types} atom types"
+            break
+
+    # Expand the Masses section: each original type -> core + corner with same mass.
+    if masses_start is not None:
+        new_mass_lines: List[str] = []
+        mi = masses_start + 1
+        # Skip the blank line after 'Masses'.
+        while mi < len(lines) and not lines[mi].strip():
+            mi += 1
+        mass_end = mi
+        old_masses: Dict[int, str] = {}
+        while mass_end < len(lines):
+            s = lines[mass_end].strip()
+            if not s:
+                break
+            if s[0].isalpha():
+                break
+            mparts = s.split()
+            old_masses[int(mparts[0])] = mparts[1]
+            mass_end += 1
+        for t in range(1, num_types + 1):
+            mass_val = old_masses.get(t, "1.0")
+            new_mass_lines.append(f"{2 * t - 1} {mass_val}")
+            new_mass_lines.append(f"{2 * t} {mass_val}")
+        lines[mi:mass_end] = new_mass_lines
+
+    flake_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return flake_path
+
+
+def build_flake_component(
+    config: "FlakeConfig",
+    build_dir: Path,
+) -> Tuple[Path, dict]:
+    """Build a shaped flake (monolayer supercell → cut shape → mark corners).
+
+    Reuses :func:`build_monolayer` to make a supercell of the flake's own
+    material, :func:`build_flake` to carve the requested outline, and
+    :func:`apply_flake_corner_types` to split corner atoms into their own
+    interleaved types (matching ``regions=[None, 'corner']``).
+
+    Args:
+        config: Flake configuration (``mat``/``cif``/``pot`` + ``shape``,
+            ``edge_length``, ``rotation_deg``, ``corner_radius``, supercell
+            ``x``/``y``).
+        build_dir: Directory to write the final ``flake_*.data`` file into.
+
+    Returns:
+        Tuple of (flake_path, flake_box_dims).
+    """
+    base_path, _dims, _pot_counts, _total_types, _supercell = build_monolayer(
+        config, edge_mode='none', edge_width=0.0
+    )
+
+    center_xy: Optional[Tuple[float, float]] = None
+    if config.center_x is not None and config.center_y is not None:
+        center_xy = (float(config.center_x), float(config.center_y))
+
+    flake_path = build_dir / f"flake_{config.mat}_{config.shape}.data"
+    build_flake(
+        base_path,
+        flake_path,
+        shape=config.shape,
+        edge_length=float(config.edge_length),
+        rotation_deg=float(config.rotation_deg),
+        center_xy=center_xy,
+    )
+    base_path.unlink(missing_ok=True)
+
+    apply_flake_corner_types(
+        flake_path,
+        shape=config.shape,
+        corner_radius=float(config.corner_radius),
+    )
+
+    flake_dims = _require_box_dims(
+        get_model_dimensions(flake_path), context=str(flake_path)
+    )
+    logger.info("Built flake component: %s", flake_path.name)
+    return flake_path, flake_dims
 
 
 def _write_cif_as_lammps_atomic(

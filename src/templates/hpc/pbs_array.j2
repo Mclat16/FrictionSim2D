@@ -39,10 +39,26 @@ fi
 
 {% if use_tmpdir %}
 SIM_ROOT=$(basename "$PBS_O_WORKDIR")
-SCRATCH={{ scratch_dir }}/${SIM_ROOT}
-mkdir -p $SCRATCH/${SIM_PATH}
-rsync -av --exclude='*.lammpstrj' --exclude='results/' --exclude='visuals/' --exclude='data/' $PBS_O_WORKDIR/${SIM_PATH}/ $SCRATCH/${SIM_PATH}/
-mkdir -p $SCRATCH/${SIM_PATH}/results $SCRATCH/${SIM_PATH}/visuals $SCRATCH/${SIM_PATH}/data
+# Per-task scratch root keeps concurrent array tasks isolated from each other.
+SCRATCH={{ scratch_dir }}/${SIM_ROOT}/task_${TASK_ID}
+
+# Shared inputs (build/, provenance/potentials/) live at the simulation's
+# config level, which may be an ancestor of SIM_PATH (e.g. AFM layer dirs share
+# one provenance/ folder). Walk up to find it and copy that whole subtree so
+# every relative path the LAMMPS script references resolves under SCRATCH.
+COPY_ROOT="$SIM_PATH"
+search="$SIM_PATH"
+while [ "$search" != "." ] && [ "$search" != "/" ]; do
+    if [ -d "$PBS_O_WORKDIR/$search/provenance" ] || [ -d "$PBS_O_WORKDIR/$search/build" ]; then
+        COPY_ROOT="$search"
+        break
+    fi
+    search=$(dirname "$search")
+done
+
+mkdir -p "$SCRATCH/$COPY_ROOT"
+rsync -av --exclude='*.lammpstrj' --exclude='results/' --exclude='visuals/' "$PBS_O_WORKDIR/$COPY_ROOT/" "$SCRATCH/$COPY_ROOT/"
+mkdir -p "$SCRATCH/${SIM_PATH}/results" "$SCRATCH/${SIM_PATH}/visuals" "$SCRATCH/${SIM_PATH}/data"
 cd $SCRATCH
 {% else %}
 cd $PBS_O_WORKDIR
@@ -55,7 +71,10 @@ if [ $? -ne 0 ]; then
 fi
 
 {% if use_tmpdir %}
-cp -r ${SIM_PATH}/results ${SIM_PATH}/visuals ${SIM_PATH}/data $PBS_O_WORKDIR/${SIM_PATH}/
+mkdir -p "$PBS_O_WORKDIR/${SIM_PATH}"
+cp -r ${SIM_PATH}/results ${SIM_PATH}/visuals ${SIM_PATH}/data "$PBS_O_WORKDIR/${SIM_PATH}/"
+# Persist indentation load states so a dependent slide phase (AFM) can read them.
+cp ${SIM_PATH}/load_*.data "$PBS_O_WORKDIR/${SIM_PATH}/" 2>/dev/null || true
 {% endif %}
 
 echo "Simulation completed successfully: ${SIM_PATH}"

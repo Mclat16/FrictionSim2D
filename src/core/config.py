@@ -223,7 +223,23 @@ class TipConfig(ComponentConfig):
     """Tip configuration parameters."""
     r: float = Field(..., description="Tip radius in Angstroms")
     amorph: Literal['c', 'a'] = Field('c', description="'c' for crystalline, 'a' for amorphous")
-    dspring: float = Field(0.0, description="Damping constant")
+    dspring: Optional[float] = Field(
+        0.0,
+        description=(
+            "Explicit viscous damping override (raw value passed to LAMMPS as damp_ev = dspring/0.016). "
+            "Defaults to 0.0 (no damping). Any set value (including 0.0) overrides damping_ratio; set it "
+            "to null/empty to auto-compute the viscous coefficient from damping_ratio instead."
+        ),
+    )
+    damping_ratio: Optional[float] = Field(
+        0.0072,
+        description=(
+            "Target damping ratio (zeta) of critical for the spring-driven tip. The viscous coefficient "
+            "is computed in the LAMMPS script from the driving spring constant and the actual tip "
+            "mass/atom count, so it stays at this zeta for any tip size or spring. Used only when "
+            "dspring is None. zeta=1 is critical; ~0.05-0.1 is a light, low-contamination default."
+        ),
+    )
     tip_x: Optional[float] = Field(
         default=None,
         description="Optional absolute AFM tip x-position in box coordinates.",
@@ -273,6 +289,58 @@ class SheetConfig(ComponentConfig):
     stack_type: str = 'AA'
     lat_c: Optional[float] = None
 
+class FlakeConfig(ComponentConfig):
+    """Shaped-flake configuration (a finite patch placed between tip and sheet).
+
+    The flake is cut from a supercell of its own 2D material into a triangle,
+    square or hexagon. During AFM indentation its corner atoms are tethered in
+    the xy-plane (free in z) so the flake keeps its shape; the restraint is
+    released before sliding.
+
+    Attributes:
+        shape: Flake outline ('triangle', 'square', 'hexagon').
+        edge_length: Characteristic size (Å). Triangle/square: side length;
+            hexagon: circumradius (center-to-vertex distance).
+        rotation_deg: In-plane rotation of the shape (degrees, CCW).
+        x, y: Supercell footprint (Å) to carve the flake from. Defaults to
+            roughly twice ``edge_length`` so the shape always fits.
+        corner_radius: Capture radius (Å) around each detected vertex used to
+            select corner atoms.
+        corner_spring_k: Spring constant (eV/Å²) for the xy corner tether
+            applied during indentation.
+        center_x, center_y: Optional flake center override (box coords). When
+            omitted the flake is centered under the tip.
+    """
+    shape: Literal['triangle', 'square', 'hexagon'] = 'hexagon'
+    edge_length: float = Field(..., description="Characteristic flake size in Angstroms")
+    rotation_deg: float = 0.0
+    x: Optional[float] = None
+    y: Optional[float] = None
+    corner_radius: float = Field(
+        default=5.0,
+        description="Capture radius (Å) around each vertex for corner-atom selection.",
+    )
+    corner_spring_k: float = Field(
+        default=10.0,
+        description="xy spring constant (eV/Å²) tethering corner atoms during indentation.",
+    )
+    center_x: Optional[float] = None
+    center_y: Optional[float] = None
+
+    @model_validator(mode='after')
+    def default_supercell_size(self) -> 'FlakeConfig':
+        """Size the carving supercell to comfortably contain the shape."""
+        margin = max(2.0 * self.corner_radius, 10.0)
+        # Hexagon edge_length is a circumradius (half-width); triangle/square
+        # edge_length is a full side. Use 2x as a safe footprint either way.
+        span = 2.0 * self.edge_length + margin
+        if self.x is None:
+            self.x = span
+        if self.y is None:
+            self.y = span
+        return self
+
+
 class GeneralConfig(BaseModel):
     """General simulation parameters."""
     temp: float = 300.0
@@ -309,6 +377,7 @@ class AFMSimulationConfig(BaseModel):
     tip: TipConfig
     sub: SubstrateConfig
     sheet: SheetConfig = Field(..., alias='2D')
+    flake: Optional[FlakeConfig] = Field(default=None, alias='flake')
     lj_override: Dict[str, Any] = Field(default_factory=dict, alias='lj_override')
     settings: GlobalSettings
 
