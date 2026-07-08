@@ -32,6 +32,29 @@ FrictionSim2D run sheetonsheet CONFIG_FILE [OPTIONS]
 
 Same options as `run afm`.
 
+### run pes-sheet
+
+```bash
+FrictionSim2D run pes-sheet CONFIG_FILE [OPTIONS]
+```
+
+Generate a static **sheet-on-sheet interlayer PES scan**: a frozen bilayer whose
+top layer is grid-scanned laterally over one surface unit cell (energy map,
+per-cell normalized) instead of a sliding run. Requires `[2D] layers = [2]` and a
+`[pes]` section (`grid_n`, optional `grid_n_refine`, `z_relax`). Same options as
+`run afm`. See [pes_scan.md](pes_scan.md).
+
+### run pes-tip
+
+```bash
+FrictionSim2D run pes-tip CONFIG_FILE [OPTIONS]
+```
+
+Generate a static **tip-on-sheet (AFM) surface PES scan**: builds and indents the
+tip + sheet + substrate stack to a low load exactly as the sliding sim, then
+grid-scans the rigid tip laterally, recording energy and the lateral force on the
+tip. Same options as `run afm`. See [pes_scan.md](pes_scan.md).
+
 ## settings
 
 ### settings show
@@ -266,6 +289,24 @@ Options:
 - `--settings PATH` — additional JSON plot-style settings
 
 `PLOT_CONFIG` must define `data_dirs`, `labels`, and `plots`. See [examples.md](examples.md) and the reference config in `documentation/publication/plots_publication.json`.
+
+### postprocess pes-scan
+
+Reduce PES-scan energy/force grids to per-material descriptor CSVs:
+
+```bash
+FrictionSim2D postprocess pes-scan RUN_ROOT [OPTIONS]
+```
+
+Options:
+
+- `-d, --data-dir PATH` (default: `data`) — output dir for `pes_scan_{sheet,tip}.csv`
+- `--grid-dir PATH` — also copy tidied per-material grids to `<grid-dir>/{sheet,tip}/<material>.csv`
+- `--kind [sheet|tip|both]` (default: `both`)
+
+Scans `RUN_ROOT` for `pes_sheet/` and `pes_tip/` results and writes one row per
+material (merge key `material`), ready for the ML feature pipeline. See
+[pes_scan.md](pes_scan.md).
 
 ## db
 

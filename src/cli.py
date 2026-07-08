@@ -154,6 +154,61 @@ def run_sheetonsheet(config_file: str, settings_file: Optional[Path], output_dir
         'sheetonsheet', config_file, output_dir, use_aiida, generate_hpc, settings_file=settings_file
     )
 
+
+@run_group.command('pes-sheet')
+@click.argument('config_file', type=click.Path(exists=True))
+@click.option('--settings-file', type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None,
+              help='Path to a settings.yaml file for this run only.')
+@click.option('--output-dir', '-o', default='simulation_output',
+              help='Output directory for generated files')
+@click.option('--aiida', 'use_aiida', is_flag=True,
+              help='Enable AiiDA provenance tracking')
+@click.option('--hpc-scripts', 'generate_hpc', is_flag=True,
+              help='Generate HPC scripts for the simulation root')
+def run_pes_sheet(config_file: str, settings_file: Optional[Path], output_dir: str,
+                  use_aiida: bool, generate_hpc: bool):
+    """Generate sheet-on-sheet interlayer PES scan files.
+
+    Builds a frozen bilayer and writes a cheap, static lateral grid-scan of the
+    interlayer potential-energy surface (corrugation barrier) instead of a
+    sliding run. Reuses the sheet-on-sheet geometry; needs [2D] layers = [2].
+
+    Example:
+        FrictionSim2D run pes-sheet examples/pes_sheet_config.ini -o ./pes_output
+    """
+    _run_simulation(
+        'pes_sheet', config_file, output_dir, use_aiida, generate_hpc, settings_file=settings_file
+    )
+
+
+@run_group.command('pes-tip')
+@click.argument('config_file', type=click.Path(exists=True))
+@click.option('--settings-file', type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None,
+              help='Path to a settings.yaml file for this run only.')
+@click.option('--output-dir', '-o', default='simulation_output',
+              help='Output directory for generated files')
+@click.option('--aiida', 'use_aiida', is_flag=True,
+              help='Enable AiiDA provenance tracking')
+@click.option('--hpc-scripts', 'generate_hpc', is_flag=True,
+              help='Generate HPC scripts for the simulation root')
+def run_pes_tip(config_file: str, settings_file: Optional[Path], output_dir: str,
+                use_aiida: bool, generate_hpc: bool):
+    """Generate tip-on-sheet (AFM) surface PES scan files.
+
+    Builds and indents the AFM tip + sheet + substrate stack to a low load
+    exactly as the sliding sim, then writes a static lateral grid-scan of the
+    tip-felt surface PES (energy + lateral force on the tip) instead of sliding.
+
+    Example:
+        FrictionSim2D run pes-tip examples/pes_tip_config.ini -o ./pes_output
+    """
+    _run_simulation(
+        'pes_tip', config_file, output_dir, use_aiida, generate_hpc, settings_file=settings_file
+    )
+
+
 def _register_simulations_aiida(simulation_dirs: List[Path], config_path: Path):
     """Register generated simulations with AiiDA."""
     try:
@@ -1043,6 +1098,37 @@ def postprocess_plot(plot_config: str, output_dir: str,
     for plot_cfg in plots:
         plotter.generate_plot(plot_cfg)
     click.echo("All plots generated.")
+
+
+@postprocess_group.command('pes-scan')
+@click.argument('run_root', type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option('--data-dir', '-d', type=click.Path(path_type=Path), default='data',
+              help='Directory for the per-material descriptor CSVs (pes_scan_{sheet,tip}.csv).')
+@click.option('--grid-dir', type=click.Path(path_type=Path), default=None,
+              help='Optional directory for tidied per-material grids (<grid-dir>/{sheet,tip}/<material>.csv).')
+@click.option('--kind', type=click.Choice(['sheet', 'tip', 'both']), default='both',
+              help='Which PES scans to reduce.')
+def postprocess_pes_scan(run_root: Path, data_dir: Path, grid_dir: Optional[Path], kind: str):
+    """Reduce PES-scan energy/force grids to per-material descriptor CSVs.
+
+    Scans RUN_ROOT for pes_sheet/ and pes_tip/ results and writes
+    data/pes_scan_sheet.csv and data/pes_scan_tip.csv (merge key 'material').
+
+    Example:
+        FrictionSim2D postprocess pes-scan ./simulation_output/simulation_YYYYMMDD_HHMMSS \\
+            --data-dir data --grid-dir outputs/pes_scan
+    """
+    from .postprocessing import pes_scan as pes  # noqa: PLC0415
+
+    kinds = ['sheet', 'tip'] if kind == 'both' else [kind]
+    written = pes.run(run_root, data_dir, grid_dir=grid_dir, kinds=kinds)
+    if not written:
+        click.echo(f"No PES-scan grids found under {run_root}.", err=True)
+        return
+    for k, path in written.items():
+        click.echo(f"✅ {k}: wrote descriptors -> {path.resolve()}")
+    if grid_dir is not None:
+        click.echo(f"📂 Grids copied under {Path(grid_dir).resolve()}/{{sheet,tip}}/")
 
 
 # =============================================================================

@@ -68,6 +68,12 @@ class DataReader:  # pylint: disable=too-many-instance-attributes
 
     # Filename patterns (compiled once at class level)
     _FILE_PATTERN_TIP = re.compile(r'fc_ave_slide_(\d+\.?\d*)nN_(\d+)angle_(\d+)ms_l(\d+)')
+    # New AFM tip naming written by the current builder, e.g.
+    # ``friction_f30_a0.0_s2_layer2.txt``. Groups match _FILE_PATTERN_TIP:
+    # (load, angle, speed, layer). Load is always a force (nN) for tip sims.
+    _FILE_PATTERN_TIP_ALT = re.compile(
+        r'friction_f(\d+\.?\d*)_a(\d+\.?\d*)_s(\d+\.?\d*)_layer(\d+)'
+    )
     _FILE_PATTERN_SHEET = re.compile(
         r'fc_ave_slide_(\d+\.?\d*)(GPa|nN)_(\d+\.?\d*)angle_(\d+\.?\d*)ms'
     )
@@ -139,7 +145,7 @@ class DataReader:  # pylint: disable=too-many-instance-attributes
             if not (is_tip or is_sheet):
                 continue
             file_patterns = (
-                (self._FILE_PATTERN_TIP,)
+                (self._FILE_PATTERN_TIP, self._FILE_PATTERN_TIP_ALT)
                 if is_tip
                 else (self._FILE_PATTERN_SHEET, self._FILE_PATTERN_SHEET_ALT)
             )
@@ -306,7 +312,10 @@ class DataReader:  # pylint: disable=too-many-instance-attributes
                         or self._FILE_PATTERN_SHEET_ALT.match(filename)
                     )
                 else:
-                    file_match = self._FILE_PATTERN_TIP.match(filename)
+                    file_match = (
+                        self._FILE_PATTERN_TIP.match(filename)
+                        or self._FILE_PATTERN_TIP_ALT.match(filename)
+                    )
                 if not file_match:
                     continue
 

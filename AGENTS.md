@@ -1,7 +1,7 @@
 # FrictionSim2D — Agent Instructions
 
 ## Project Overview
-Python framework for generating and running LAMMPS friction simulations of 2D materials. Supports AFM and sheet-on-sheet setups with HPC job generation, optional AiiDA provenance tracking, a REST API, and postprocessing/plotting tools.
+Python framework for generating and running LAMMPS friction simulations of 2D materials. Supports AFM and sheet-on-sheet setups, static PES (potential-energy-surface / corrugation-barrier) scans, HPC job generation, optional AiiDA provenance tracking, a REST API, and postprocessing/plotting tools.
 
 See [documentation/mainpage.md](documentation/mainpage.md) for full project overview and [documentation/README.md](documentation/README.md) for the documentation index.
 
@@ -34,7 +34,8 @@ frictionsim2d-install-hooks
 ```
 src/
   core/          Config loading (settings.yaml + .ini), LAMMPS runner, potential manager
-  builders/      AFM and sheet-on-sheet simulation builders; produce LAMMPS inputs
+  builders/      AFM, sheet-on-sheet, and PES-scan simulation builders; produce LAMMPS inputs
+                 (pes_scan.py subclasses AFM/SheetOnSheet for static corrugation scans)
   interfaces/    External tool adapters: lammps.py, atomsk.py, jinja.py
   templates/     Jinja2 templates for LAMMPS input scripts and HPC job files
   hpc/           PBS/Slurm/Bash job script generation (scripts.py, manifest.py)

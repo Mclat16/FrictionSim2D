@@ -1,0 +1,93 @@
+# LAMMPS input script for tip-on-sheet (AFM) surface PES scan (self-contained).
+# Assembles the tip + sheet + substrate, places the rigid tip at a fixed firm
+# contact gap above the sheet (stable, unlike the dynamic indentation), then holds
+# it at each lateral grid point and records the total energy and the lateral force
+# on the tip (the friction signal). The static contact is forced (always stable) and
+# essentially load-independent, so the deployable descriptor is this fixed firm
+# contact; the '2 nN pathology' lives in the dynamic friction *target*, not here.
+#   - substrate base (sub_fix) held fixed throughout
+#   - tip (tip_all) placed at a fixed contact gap, then grid-scanned
+{% if z_relax %}#   - sheet + substrate relax at each grid point (relaxed tip-felt PES)
+{% else %}#   - sheet held (rigid scan): each grid point is a single energy evaluation
+{% endif %}# No dynamics, no sliding.
+
+clear
+units           metal
+atom_style      {{ atom_style }}
+boundary        p p p
+
+neighbor        {{ neighbor_list }} bin
+{{ neigh_modify_command }}
+comm_style      tiled
+thermo          {{ thermo }}
+timestep        {{ timestep }}
+
+region          box block {{ xlo }} {{ xhi }} {{ ylo }} {{ yhi }} -5 {{ zhi_box }}
+create_box      {{ ngroups }} box
+read_data       {{ sub_file }} add append group sub
+read_data       {{ tip_file }} add append shift {{ tip_x }} {{ tip_y }} {{ tip_z }} group tip offset {{ sub_natypes }} 0 0 0 0
+read_data       {{ sheet_file }} add append shift {{ sheet_shift_x }} {{ sheet_shift_y }} {{ sheet_z }} group 2D offset {{ offset_2d }} 0 0 0 0
+include         {{ potential_file }}
+balance         1.0 rcb
+
+min_style       {{ min_style }}
+
+# sub_fix, tip_all and 2D_all groups are defined in system.in.settings.
+fix             sub_hold sub_fix setforce 0.0 0.0 0.0
+fix             tip_hold tip_all setforce 0.0 0.0 0.0
+
+# --- 1) settle sheet + substrate with the tip held clear --------------------------
+compute         cz_tip tip_all reduce min z
+compute         cz_sheet 2D_all reduce max z
+{{ minimization_command }}
+
+# --- 2) place the (rigid) tip at a fixed firm contact gap above the sheet ----------
+# The tip is built well above the sheet; measure the current tip-bottom / sheet-top
+# z and translate the rigid tip down to a fixed contact gap. Deterministic and
+# per-material; a compliant monolayer conforms to a pressed tip so a fixed gap is a
+# cleaner, load-independent contact than a force setpoint.
+variable        approach equal (c_cz_tip-c_cz_sheet)-{{ contact_gap }}
+displace_atoms  tip_all move 0.0 0.0 $(-v_approach) units box
+# relax the sheet + substrate under the tip at the fixed contact
+{{ minimization_command }}
+
+# --- 3) lateral force the surface exerts on the (rigid, held) tip ------------------
+# setforce stores the total group force *before* zeroing in f_tip_hold[1..3].
+variable        fx equal f_tip_hold[1]*{{ ev_a_to_nn }}
+variable        fy equal f_tip_hold[2]*{{ ev_a_to_nn }}
+
+# --- lateral scan grid over one surface unit cell ---------------------------------
+variable        Nx     equal {{ grid_n }}
+variable        Ny     equal {{ grid_n }}
+variable        Lx     equal {{ period_x }}
+variable        Ly     equal {{ period_y }}
+variable        dxstep equal v_Lx/v_Nx
+variable        dystep equal v_Ly/v_Ny
+
+# CSV: x, y in Angstrom (tip displacement); energy_eV total; fx, fy in nN.
+print           "x,y,energy_eV,fx,fy" file {{ results_csv }} screen no
+
+# Move the tip only by the delta from the previous grid point to the current one.
+variable        prev_dx equal 0.0
+variable        prev_dy equal 0.0
+
+variable        ix loop ${Nx}
+label           loop_ix
+variable        iy loop ${Ny}
+label           loop_iy
+variable        dx equal (v_ix-1)*v_dxstep
+variable        dy equal (v_iy-1)*v_dystep
+displace_atoms  tip_all move $(v_dx-v_prev_dx) $(v_dy-v_prev_dy) 0.0 units box
+variable        prev_dx equal $(v_dx)
+variable        prev_dy equal $(v_dy)
+{% if z_relax %}
+{{ minimization_command }}
+{% else %}
+run             0
+{% endif %}
+variable        pe_now equal pe
+print           "$(v_dx),$(v_dy),$(v_pe_now),$(v_fx),$(v_fy)" append {{ results_csv }} screen no
+next            iy
+jump            SELF loop_iy
+next            ix
+jump            SELF loop_ix

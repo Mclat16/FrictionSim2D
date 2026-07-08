@@ -339,6 +339,47 @@ def test_afm_scan_angle_force_accepts_multiple_targets(tmp_path: Path) -> None:
     assert "then \"next scan_angle_force\"" in slide_script
 
 
+def test_afm_outer_loop_force_splits_slide_per_load(tmp_path: Path) -> None:
+    """outer_loop=force emits one slide_f<load>N.in per load, sharing system.in."""
+    config = _make_afm_config(tmp_path, layers=[1])
+    config.general.force = [2.0, 5.0, 10.0]
+    config.general.outer_loop = "force"
+
+    builder = AFMSimulation(config, output_dir=str(tmp_path / "out"))
+    _prepare_builder_for_slide_write(builder, tmp_path)
+    lammps_dir = tmp_path / "out" / "L1" / "lammps"
+
+    # One shared system.in; one slide script per load; no monolithic slide.in.
+    assert (lammps_dir / "system.in").exists()
+    assert not (lammps_dir / "slide.in").exists()
+    slide_scripts = sorted(p.name for p in lammps_dir.glob("slide_*.in"))
+    assert slide_scripts == ["slide_f10N.in", "slide_f2N.in", "slide_f5N.in"]
+
+    # system.in still writes every load's data file (full force loop retained).
+    system_script = (lammps_dir / "system.in").read_text(encoding="utf-8")
+    assert "variable        find index 2.0 5.0 10.0" in system_script
+
+    # Each split slide reads its own load and pins a scalar force (no force loop).
+    slide_5 = (lammps_dir / "slide_f5N.in").read_text(encoding="utf-8")
+    assert "read_data       out/L1/data/load_$(v_find)N.data" in slide_5
+    assert "variable        find equal 5.0" in slide_5
+    assert "label           force_loop" not in slide_5
+
+
+def test_afm_outer_loop_force_single_load_stays_slide_in(tmp_path: Path) -> None:
+    """A single load keeps slide.in so the combined system+slide HPC path applies."""
+    config = _make_afm_config(tmp_path, layers=[1])
+    config.general.force = [10.0]
+    config.general.outer_loop = "force"
+
+    builder = AFMSimulation(config, output_dir=str(tmp_path / "out"))
+    _prepare_builder_for_slide_write(builder, tmp_path)
+    lammps_dir = tmp_path / "out" / "L1" / "lammps"
+
+    assert (lammps_dir / "slide.in").exists()
+    assert not list(lammps_dir.glob("slide_f*.in"))
+
+
 def test_afm_explicit_tip_x_ignores_tip_x_offset(tmp_path: Path) -> None:
     """Explicit tip_x should be used exactly; tip_x_offset should not be applied."""
     config = _make_afm_config(tmp_path, layers=[1])

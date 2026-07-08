@@ -135,6 +135,31 @@ Important implementation detail:
 - Those four are handled inside generated LAMMPS scripts.
 - AFM layer lists are handled in the AFM builder and produce `L<N>` subdirectories.
 
+### Splitting a sweep into per-value scripts (`outer_loop`)
+
+By default the four in-script sweeps above run as a single looped script (one
+`slide.in` that iterates over every value). Set `outer_loop` in `[general]` to
+instead emit **one slide script per value**, so each becomes its own HPC job and
+they run in parallel rather than back-to-back:
+
+| `outer_loop` | Model | Emits | Per value |
+|---|---|---|---|
+| `force` | AFM | `slide_f<load>N.in` | one job per load |
+| `pressure` | sheet-on-sheet | `slide_p<value>gpa.in` | one job per pressure |
+| `scan_speed` | sheet-on-sheet | `slide_<value>ms.in` | one job per speed |
+
+For AFM `outer_loop = force`, a single `system.in` (indentation phase) still
+writes every `load_<load>N.data`, and each `slide_f<load>N.in` reads its own
+load file. The HPC generator wires this as a two-phase submission: the per-load
+slide array depends on the shared system job completing first. A single-value
+`force` list stays as `slide.in` (nothing to split).
+
+```ini
+[general]
+force = [2, 5, 10, 20, 30, 50, 70, 85, 100]
+outer_loop = force
+```
+
 ### Material List Expansion
 
 Use placeholder replacement from a text list:

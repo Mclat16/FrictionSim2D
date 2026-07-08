@@ -188,6 +188,15 @@ Generate sheet-on-sheet simulations:
 FrictionSim2D run sheetonsheet examples/sheet_config.ini --output-dir ./simulation_output
 ```
 
+Generate static PES (corrugation-barrier) scans — cheap energy-vs-lateral-position maps:
+
+```bash
+FrictionSim2D run pes-sheet examples/pes_sheet_config.ini --output-dir ./simulation_output
+FrictionSim2D run pes-tip   examples/pes_tip_config.ini   --output-dir ./simulation_output
+```
+
+See [documentation/pes_scan.md](documentation/pes_scan.md).
+
 Generate with AiiDA registration enabled:
 
 ```bash
@@ -204,10 +213,11 @@ FrictionSim2D hpc generate ./simulation_output/simulation_YYYYMMDD_HHMMSS --sche
 
 - `FrictionSim2D run afm ...`
 - `FrictionSim2D run sheetonsheet ...`
+- `FrictionSim2D run pes-sheet ...` / `FrictionSim2D run pes-tip ...` (static PES scans)
 - `FrictionSim2D hpc generate ...`
 - `FrictionSim2D settings show|init|reset`
 - `FrictionSim2D aiida status|setup|submit|import|query|export|import-archive|package`
-- `FrictionSim2D postprocess read|plot`
+- `FrictionSim2D postprocess read|plot|pes-scan`
 - `FrictionSim2D db init|create-key|upload|stage|query|stats|delete|publish|reject`
 - `FrictionSim2D api serve`
 

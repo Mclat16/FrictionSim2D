@@ -27,10 +27,15 @@ from . import components
 
 logger = logging.getLogger(__name__)
 
+#: Default minimum layer count for a dynamic sheet-on-sheet stack (fixed bottom,
+#: thermostatted middle, driven top). Static PES bilayer scans override this.
 MIN_LAYERS = 3
 
 
 class SheetOnSheetSimulation(SimulationBase):
+    #: Minimum number of layers this builder accepts. Subclasses (e.g. the
+    #: static PES bilayer scan) may lower it.
+    MIN_LAYERS: int = MIN_LAYERS
     """Builder for Sheet-on-Sheet friction simulations.
 
     Creates an N-layer stack of the same 2D material:
@@ -49,6 +54,7 @@ class SheetOnSheetSimulation(SimulationBase):
         self.pm: Optional[PotentialManager] = None
         self.lat_c: Optional[float] = None
         self.sheet_dims: Optional[Dict] = None
+        self.sheet_unit_cell: Dict[str, float] = {}
 
     @property
     def n_layers(self) -> int:
@@ -78,9 +84,9 @@ class SheetOnSheetSimulation(SimulationBase):
     def build(self) -> None:
         """Constructs the N-layer sheet stack."""
         n_layers = self.n_layers
-        if n_layers < MIN_LAYERS:
+        if n_layers < self.MIN_LAYERS:
             raise ValueError(
-                f"Sheet-on-sheet requires at least {MIN_LAYERS} layers, "
+                f"Sheet-on-sheet requires at least {self.MIN_LAYERS} layers, "
                 f"got {n_layers}"
             )
 
@@ -113,6 +119,7 @@ class SheetOnSheetSimulation(SimulationBase):
             stacking_type=stacking_type,
             edge_mode=self.config.settings.geometry.finite_sheet_sheetonsheet_edge_mode,
             edge_width=self.config.settings.geometry.finite_sheet_edge_width,
+            unit_cell_out=self.sheet_unit_cell,
         )
         self.structure_paths['sheet'] = sheet_path
 
@@ -175,8 +182,7 @@ class SheetOnSheetSimulation(SimulationBase):
         sheet_edge_regions = [None, 'edge'] if self.config.settings.geometry.finite_sheet_sheetonsheet_edge_mode != 'none' else None
         pm.register_component('sheet', self.config.sheet, n_layers=n_layers, regions=sheet_edge_regions)
 
-        if self.config.settings.simulation.drive_method == 'virtual_atom':
-            pm.register_virtual_atom()
+        self._register_drive_atom(pm)
 
         pm.add_self_interaction('sheet')
 
@@ -203,6 +209,17 @@ class SheetOnSheetSimulation(SimulationBase):
         self.groups['all_types'] = pm.types.get_group_string('sheet')
 
         return pm
+
+    def _register_drive_atom(self, pm: PotentialManager) -> None:
+        """Register the virtual driving atom when the drive method needs one.
+
+        A dynamic sliding run drives the top layer with a virtual atom. The
+        static PES scan has no driving, so :class:`PESSheetSimulation` overrides
+        this to a no-op (keeping the atom-type count aligned with the packed
+        bilayer, which contains real atoms only).
+        """
+        if self.config.settings.simulation.drive_method == 'virtual_atom':
+            pm.register_virtual_atom()
 
     def _build_layer_groups(self) -> Dict[str, str]:
         """Build a dict mapping 'layer_N_types' to group type strings."""

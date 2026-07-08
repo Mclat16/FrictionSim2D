@@ -21,9 +21,16 @@ from .config import (
 from .path_utils import format_dimension_token
 from ..builders.afm import AFMSimulation
 from ..builders.sheetonsheet import SheetOnSheetSimulation
+from ..builders.pes_scan import PESSheetSimulation, PESTipSimulation
 from ..hpc import HPCScriptGenerator, HPCConfig
 
 logger = logging.getLogger(__name__)
+
+#: Simulation models sharing the AFM stack (tip + sheet + substrate) and its
+#: two-phase system.in → slide.in layout.
+AFM_LIKE_MODELS = frozenset({'afm', 'pes_tip'})
+#: Simulation models sharing the sheet-on-sheet stack (single slide.in run).
+SHEET_LIKE_MODELS = frozenset({'sheetonsheet', 'pes_sheet'})
 
 
 def layer_aware_path_sort_key(path_str: str) -> Tuple[Tuple[int, Union[int, str]], ...]:
@@ -346,12 +353,17 @@ def run_simulations(
         defaults.aiida.enabled = True
         defaults.aiida.create_provenance = True
 
-    if model == 'sheetonsheet':
+    if model in SHEET_LIKE_MODELS:
         if defaults.hpc.lammps_scripts == ['system.in', 'slide.in']:
             defaults.hpc.lammps_scripts = ['slide.in']
-    elif model == 'afm':
+    elif model in AFM_LIKE_MODELS:
         if defaults.hpc.lammps_scripts == ['slide.in']:
             defaults.hpc.lammps_scripts = ['system.in', 'slide.in']
+
+    # pes_tip uses the AFM stack (geometry/output layout) but is self-contained:
+    # a single static scan script, no separate system.in indentation phase.
+    if model == 'pes_tip':
+        defaults.hpc.lammps_scripts = ['slide.in']
 
     if ensure_hpc_settings is not None and generate_hpc:
         ensure_hpc_settings(defaults.hpc)
@@ -378,7 +390,8 @@ def run_simulations(
         temp = run_dict['general'].get('temp', 300)
         size_token = f"{format_dimension_token(x)}x_{format_dimension_token(y)}y"
 
-        if model == "afm":
+        top_dir = model  # 'afm' | 'sheetonsheet' | 'pes_tip' | 'pes_sheet'
+        if model in AFM_LIKE_MODELS:
             tip_mat = run_dict.get('tip', {}).get('mat', 'Si')
             tip_amorph = run_dict.get('tip', {}).get('amorph', 'c')
             tip_r = run_dict.get('tip', {}).get('r', 25)
@@ -389,13 +402,13 @@ def run_simulations(
             tip_str = f"{tip_amorph}{tip_mat}" if tip_amorph == 'a' else tip_mat
 
             output_dir = (
-                simulation_root / "afm" / mat / size_token /
+                simulation_root / top_dir / mat / size_token /
                 f"sub_{sub_str}_tip_{tip_str}_r{int(tip_r)}" /
                 f"K{int(temp)}"
             )
         else:
             output_dir = (
-                simulation_root / "sheetonsheet" / mat / size_token /
+                simulation_root / top_dir / mat / size_token /
                 f"K{int(temp)}"
             )
 
@@ -403,16 +416,18 @@ def run_simulations(
         prov_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            if model == 'afm':
+            if model in AFM_LIKE_MODELS:
                 config_obj = AFMSimulationConfig(**run_dict)
                 config_json_path = prov_dir / 'config.json'
                 config_json_path.write_text(config_obj.model_dump_json(indent=2), encoding='utf-8')
-                builder = AFMSimulation(config_obj, output_dir, config_path=str(config_json_path))
+                builder_cls = PESTipSimulation if model == 'pes_tip' else AFMSimulation
+                builder = builder_cls(config_obj, output_dir, config_path=str(config_json_path))
             else:
                 config_obj = SheetOnSheetSimulationConfig(**run_dict)
                 config_json_path = prov_dir / 'config.json'
                 config_json_path.write_text(config_obj.model_dump_json(indent=2), encoding='utf-8')
-                builder = SheetOnSheetSimulation(config_obj, output_dir, config_path=str(config_json_path))
+                builder_cls = PESSheetSimulation if model == 'pes_sheet' else SheetOnSheetSimulation
+                builder = builder_cls(config_obj, output_dir, config_path=str(config_json_path))
 
             builder.set_base_output_dir(simulation_root)
             builder.build()

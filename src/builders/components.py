@@ -685,62 +685,36 @@ def _orthogonalize_lammps_data(input_path: Path, output_path: Path) -> None:
             lmp.close()
         return
 
-    # Triclinic box: use ASE to build a minimum orthogonal supercell.
-    # Read the structure; preserve specorder from the Masses section.
-    masses_lines = []
-    in_masses = False
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped == 'Masses':
-            in_masses = True
-            continue
-        if in_masses:
-            if stripped == '' or stripped.startswith('Atoms'):
-                if stripped.startswith('Atoms'):
-                    in_masses = False
-                continue
-            parts = stripped.split()
-            if len(parts) >= 2 and parts[0].isdigit():
-                masses_lines.append(stripped)
+    # Triclinic box: build a minimum orthogonal supercell with ASE, preserving
+    # each atom's explicit LAMMPS type so that sublattice types that share a
+    # chemical element (e.g. Se1/Se2, Al1/Al2) survive the supercell tiling.
+    # (Mapping types->elements, as ASE does by default, would collapse them.)
+    # Each type is carried through make_supercell/write as a *distinct placeholder
+    # element*; the real masses/elements are restored afterward. Writing via
+    # ase_io.write keeps the box in LAMMPS restricted-triclinic orientation.
+    # The non-tilt LAMMPS change_box path above already preserves types.
+    from ase import Atoms as _Atoms  # pylint: disable=import-outside-toplevel
+    from ase.data import chemical_symbols as _csym  # pylint: disable=import-outside-toplevel
 
-    specorder = None
-    if masses_lines:
-        specorder = []
-        for mline in masses_lines:
-            parts = mline.split()
-            if '#' in mline:
-                specorder.append(mline.split('#')[-1].strip())
+    cell, atom_rows, masses = _parse_lammps_cell_atoms_masses(content)
+    types = [t for (t, *_r) in atom_rows]
+    positions = [(x, y, z) for (_t, x, y, z) in atom_rows]
+    n_types = max(masses) if masses else (max(types) if types else 1)
+    placeholders = [_csym[i] for i in range(1, n_types + 1)]  # H, He, Li, ... per type
+    symbols = [placeholders[t - 1] for t in types]
 
-    atoms = ase_io.read(str(input_path), format='lammps-data',
-                        atom_style='atomic', units='metal',
-                        Z_of_type={i + 1: _element_z(el)
-                                   for i, el in enumerate(specorder or [])})
-    if isinstance(atoms, list):
-        atoms = atoms[0]
-
-    # Build a minimum orthogonal (no-tilt) supercell.
-    # For hexagonal cells, [[1,0,0],[1,2,0],[0,0,1]] gives an orthorhombic 2× cell.
-    cell = atoms.get_cell()
-    transform_matrix = _find_ortho_transform(cell)
+    atoms = _Atoms(symbols=symbols, positions=positions, cell=cell, pbc=True)
+    transform_matrix = _find_ortho_transform(atoms.get_cell())
     ortho_atoms = _make_supercell(atoms, transform_matrix)
+    ortho_atoms.wrap()
 
-    write_kwargs: dict = {'filename': str(output_path), 'images': ortho_atoms,
-                          'format': 'lammps-data', 'atom_style': 'atomic'}
-    if specorder:
-        write_kwargs['specorder'] = specorder
-    ase_io.write(**write_kwargs)
+    ase_io.write(str(output_path), ortho_atoms, format='lammps-data',
+                 atom_style='atomic', specorder=placeholders)
 
-    # Re-inject Masses section (ASE omits it)
-    if specorder:
-        from ase.data import atomic_masses as _am, atomic_numbers as _an  # pylint: disable=import-outside-toplevel
-        masses_block = "Masses\n\n"
-        for idx, element in enumerate(specorder, start=1):
-            mass = _am[_an[element]]
-            masses_block += f"{idx} {mass:.6f}  # {element}\n"
-        masses_block += "\n"
-        out_content = output_path.read_text(encoding='utf-8')
-        out_content = _re.sub(r'(Atoms\s)', masses_block + r'\1', out_content, count=1)
-        output_path.write_text(out_content, encoding='utf-8')
+    # Restore the real Masses section (ASE writes placeholder masses / omits it).
+    real_masses = {t: masses.get(t, (1.0, 'X')) for t in range(1, n_types + 1)}
+    _restore_masses_section(output_path, real_masses)
+    _snap_small_tilts(output_path)
 
 
 def _element_z(symbol: str) -> int:
@@ -771,18 +745,23 @@ def _find_ortho_transform(cell) -> "np.ndarray":
     if abs(_np.dot(a1, a2)) < 1e-6 * _np.linalg.norm(a1) * _np.linalg.norm(a2):
         return _np.eye(3, dtype=int)
 
-    # Search for n1, n2 integers (smallest |det|) such that n1*a1 + n2*a2 is along y.
+    # Search for n1, n2 integers (smallest cell) such that n1*a1 + n2*a2 is ~along y.
+    # A relative x-tolerance accepts slightly-distorted (near-hexagonal) cells whose
+    # a/b ratio is not exactly commensurate (e.g. GaO's a2/a1 = -0.50002); the tiny
+    # residual tilt is snapped to zero after the supercell is built.
     best_transform = None
-    best_det = None
-    search_range = range(-6, 7)
+    best_key = None
+    x_tol = max(1e-6, 5e-3 * float(_np.linalg.norm(a1)))
+    search_range = range(-12, 13)
     for n1 in search_range:
         for n2 in search_range:
             if n1 == 0 and n2 == 0:
                 continue
             trial = n1 * a1 + n2 * a2
-            if abs(trial[0]) < 1e-6 and abs(trial[1]) > 1e-3:
-                if best_det is None or abs(n2) < best_det:
-                    best_det = abs(n2)
+            if abs(trial[0]) < x_tol and abs(trial[1]) > 1e-3:
+                key = (abs(n2), abs(n1), abs(trial[0]))
+                if best_key is None or key < best_key:
+                    best_key = key
                     best_transform = _np.array([[1, 0, 0], [n1, n2, 0], [0, 0, 1]], dtype=int)
 
     if best_transform is not None:
@@ -791,6 +770,215 @@ def _find_ortho_transform(cell) -> "np.ndarray":
     # Fallback: identity (leave as-is)
     return _np.eye(3, dtype=int)
 
+
+
+def _parse_lammps_cell_atoms_masses(content: str):
+    """Parse a LAMMPS ``atomic``-style data file string.
+
+    Returns:
+        Tuple of (cell 3x3 list, atoms [(type, x, y, z)], masses {type: (mass, element)}).
+        Atoms are returned in file order; the cell includes any xy/xz/yz tilt.
+    """
+    bounds = {}
+    tilt = {'xy': 0.0, 'xz': 0.0, 'yz': 0.0}
+    masses: Dict[int, tuple] = {}
+    atoms = []
+    section = None
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.split('#', 1)[0].strip()
+        if low.endswith(('xlo xhi', 'ylo yhi', 'zlo zhi')):
+            parts = low.split()
+            key = parts[2][0]  # 'x' | 'y' | 'z'
+            bounds[f'{key}lo'] = float(parts[0])
+            bounds[f'{key}hi'] = float(parts[1])
+            continue
+        if low.endswith('xy xz yz'):
+            parts = low.split()
+            tilt['xy'], tilt['xz'], tilt['yz'] = (float(parts[0]), float(parts[1]), float(parts[2]))
+            continue
+        if line in ('Masses', 'Atoms') or line.startswith('Atoms'):
+            section = 'Masses' if line == 'Masses' else 'Atoms'
+            continue
+        if line in ('Velocities', 'Bonds', 'Angles'):
+            section = None
+            continue
+        if section == 'Masses':
+            parts = line.split()
+            if parts[0].lstrip('-').isdigit():
+                elem = line.split('#')[-1].strip().split()[0] if '#' in line else 'X'
+                masses[int(parts[0])] = (float(parts[1]), elem)
+        elif section == 'Atoms':
+            parts = low.split()
+            if len(parts) >= 5 and parts[0].lstrip('-').isdigit():
+                atoms.append((int(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
+
+    lx = bounds['xhi'] - bounds['xlo']
+    ly = bounds['yhi'] - bounds['ylo']
+    lz = bounds['zhi'] - bounds['zlo']
+    cell = [[lx, 0.0, 0.0], [tilt['xy'], ly, 0.0], [tilt['xz'], tilt['yz'], lz]]
+    return cell, atoms, masses
+
+
+def _write_lammps_typed(output_path: Path, cell, positions, types,
+                        masses: Dict[int, tuple]) -> None:
+    """Write a LAMMPS ``atomic`` data file preserving explicit per-atom types.
+
+    Args:
+        output_path: Destination path.
+        cell: 3x3 lower-triangular cell (rows are a, b, c vectors).
+        positions: Nx3 atom coordinates.
+        types: length-N per-atom integer type ids.
+        masses: mapping type-id -> (mass, element) for the Masses section.
+    """
+    n_types = max(masses) if masses else max(types)
+    lx, ly, lz = cell[0][0], cell[1][1], cell[2][2]
+    xy, xz, yz = cell[1][0], cell[2][0], cell[2][1]
+    lines = [
+        "LAMMPS data file via FrictionSim2D (type-preserving orthogonalization)\n\n",
+        f"{len(positions)} atoms\n",
+        f"{n_types} atom types\n\n",
+        f"0.0 {lx:.12f} xlo xhi\n",
+        f"0.0 {ly:.12f} ylo yhi\n",
+        f"0.0 {lz:.12f} zlo zhi\n",
+    ]
+    if any(abs(v) > 1e-10 for v in (xy, xz, yz)):
+        lines.append(f"{xy:.12f} {xz:.12f} {yz:.12f} xy xz yz\n")
+    lines.append("\nMasses\n\n")
+    for t in range(1, n_types + 1):
+        mass, elem = masses.get(t, (1.0, 'X'))
+        lines.append(f"{t} {mass:.6f}  # {elem}\n")
+    lines.append("\nAtoms # atomic\n\n")
+    for i, (pos, t) in enumerate(zip(positions, types), start=1):
+        lines.append(f"{i} {int(t)} {pos[0]:.12f} {pos[1]:.12f} {pos[2]:.12f}\n")
+    output_path.write_text(''.join(lines), encoding='utf-8')
+
+
+def _snap_small_tilts(path: Path, tol: float = 0.05) -> None:
+    """Drop a negligible xy/xz/yz tilt line so the box is treated as orthogonal.
+
+    Near-hexagonal cells orthogonalize to a box with a sub-0.01 Å residual tilt
+    (float non-commensurability). LAMMPS then refuses to stack such a box onto an
+    orthogonal one ("cannot switch to restricted triclinic"), so we snap tiny
+    tilts to zero (atom displacement over the box is far below tol).
+    """
+    lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+    out = []
+    for line in lines:
+        low = line.split('#', 1)[0].strip()
+        if low.endswith('xy xz yz'):
+            parts = low.split()
+            if all(abs(float(parts[i])) < tol for i in range(3)):
+                continue  # drop the tilt line -> orthogonal box
+        out.append(line)
+    path.write_text(''.join(out), encoding='utf-8')
+
+
+def _restore_masses_section(path: Path, masses: Dict[int, tuple]) -> None:
+    """Insert/replace the Masses section of a LAMMPS data file with real values.
+
+    ``ase_io.write`` for ``lammps-data`` omits (or writes placeholder) masses;
+    this writes ``type mass  # element`` lines so downstream element parsing works.
+
+    Args:
+        path: LAMMPS data file (modified in-place).
+        masses: mapping type-id -> (mass, element).
+    """
+    import re as _re  # pylint: disable=import-outside-toplevel
+
+    lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+    out = []
+    skip_masses = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == 'Masses':
+            skip_masses = True
+            continue
+        if skip_masses:
+            # Consume the existing (placeholder) Masses block until a blank-then-section.
+            if stripped and not stripped[0].isdigit():
+                skip_masses = False
+                # fall through to emit this line (likely 'Atoms ...')
+            else:
+                continue
+        out.append(line)
+
+    block = "Masses\n\n"
+    for t in range(1, (max(masses) if masses else 0) + 1):
+        mass, elem = masses.get(t, (1.0, 'X'))
+        block += f"{t} {mass:.6f}  # {elem}\n"
+    block += "\n"
+
+    text = ''.join(out)
+    text = _re.sub(r'(^|\n)(Atoms)', r'\1' + block + r'\2', text, count=1)
+    path.write_text(text, encoding='utf-8')
+
+
+def _assign_pot_types_by_order(path: Path, order: List[str],
+                               counts: Dict[str, int]) -> None:
+    """Assign potential sublattice types to a primitive cell, in-place.
+
+    Used when the number of atoms equals the number of potential types
+    (``type_multiplier == 1`` with sublattice types, e.g. t-PtSe2's Pt/Se1/Se2).
+    Each element's atoms are assigned that element's block of sublattice type ids
+    in file order (cycling if there are more atoms than sublattice types), giving
+    exactly ``sum(counts)`` types. The subsequent orthogonalization tiles these
+    types across the supercell.
+
+    Args:
+        path: Primitive LAMMPS data file (modified in-place).
+        order: Element order from the potential (e.g. ['Pt', 'Se']).
+        counts: Sublattice-type count per element (e.g. {'Pt': 1, 'Se': 2}).
+    """
+    from ase.data import atomic_masses as _am, atomic_numbers as _an  # pylint: disable=import-outside-toplevel
+
+    cell, atoms, masses = _parse_lammps_cell_atoms_masses(path.read_text(encoding='utf-8'))
+
+    # Map each current type-id to an element. Prefer the Masses ``# element``
+    # comment, but fall back to the nearest atomic mass among the potential's
+    # elements when it is missing: LAMMPS ``replicate``/``write_data`` (used by
+    # _duplicate_lammps_data just before this call) strips those comments. Without
+    # the fallback every atom is left unmatched, its type is never reassigned, and
+    # the potential's sublattice types collapse to one type per element.
+    order_masses = {el: float(_am[_an[el]]) for el in order}
+
+    def _element_for(cur_type: int) -> str:
+        mass, elem = masses.get(cur_type, (None, 'X'))
+        if elem in order_masses:
+            return elem
+        if mass is not None and order_masses:
+            return min(order_masses, key=lambda el: abs(order_masses[el] - mass))
+        return order[0]
+
+    cur_type_elem = {t: _element_for(t) for t in masses}
+
+    # Contiguous type-id block per element, in potential order.
+    elem_type_ids: Dict[str, List[int]] = {}
+    next_id = 1
+    for el in order:
+        n = int(counts[el])
+        elem_type_ids[el] = list(range(next_id, next_id + n))
+        next_id += n
+
+    counters = {el: 0 for el in order}
+    new_types = []
+    for (cur_type, *_xyz) in atoms:
+        el = cur_type_elem.get(cur_type, order[0])
+        ids = elem_type_ids.get(el)
+        if not ids:  # element not in potential order: leave as-is
+            new_types.append(cur_type)
+            continue
+        new_types.append(ids[counters[el] % len(ids)])
+        counters[el] += 1
+
+    new_masses = {
+        tid: (float(_am[_an[el]]), el)
+        for el, ids in elem_type_ids.items() for tid in ids
+    }
+    positions = [(x, y, z) for (_t, x, y, z) in atoms]
+    _write_lammps_typed(path, cell, positions, new_types, new_masses)
 
 
 def _duplicate_lammps_data(
@@ -1651,54 +1839,52 @@ def build_monolayer(
     temp_unit_cell = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_unit.lmp"
     _write_cif_as_lammps_atomic(cif_path, temp_unit_cell, specorder=cif_elements)
 
-    # Orthogonalize FIRST (while the file has only the simple CIF element types),
-    # then renumber.  Renumbering after orthogonalization avoids confusion in the
-    # ASE-based tilt removal when types outnumber distinct chemical elements.
+    has_sublattice_types = any(v != 1 for v in pot_counts.values())
+
+    # When the primitive already holds exactly `total_pot_types` atoms
+    # (type_multiplier == 1, e.g. t-PtSe2's Pt/Se1/Se2), assign the potential
+    # sublattice types on the PRIMITIVE, then let the (type-preserving)
+    # orthogonalization tile them across the supercell. Assigning them *after*
+    # orthogonalization instead produced one unique type per atom, because
+    # orthogonalization multiplies the atom count (the pre-fix failure mode).
+    assign_on_primitive = has_sublattice_types and type_multiplier == 1
+    if assign_on_primitive:
+        _assign_pot_types_by_order(temp_unit_cell, pot_element_order, pot_counts)
+
+    # Orthogonalize. _orthogonalize_lammps_data preserves each atom's explicit
+    # LAMMPS type, so sublattice types assigned above survive the tiling.
     ortho_cell = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_ortho.lmp"
     _orthogonalize_lammps_data(temp_unit_cell, ortho_cell)
     temp_unit_cell.unlink()
 
-    if any(v != 1 for v in pot_counts.values()) or type_multiplier != 1:
-        renumber_atom_types(ortho_cell, pot=pot_element_order)
+    # Types are assigned either on the primitive (type_multiplier == 1, above) or
+    # on the duplicated potential cell (type_multiplier > 1, below), so the
+    # orthogonalized element-typed cell needs no post-ortho renumber here.
 
     dims = get_model_dimensions(ortho_cell)
 
     if type_multiplier != 1:
-        atoms = ase_io.read(str(ortho_cell), format="lammps-data")
-        num_atoms = len(atoms)
-        dup_factor_x = 1
-        dup_factor_y = 1
-        if total_pot_types % num_atoms == 0:
-            for factor_candidate in range(int(np.sqrt(total_pot_types / num_atoms)) + 1, 0, -1):
-                if (total_pot_types / num_atoms) % factor_candidate == 0:
-                    dup_factor_x = int(factor_candidate)
-                    dup_factor_y = int(total_pot_types / num_atoms / factor_candidate)
+        # The potential defines `total_pot_types` types for a k× supercell of the
+        # primitive (e.g. p-SnS: 8 types on a 2× cell; h-MoS2: 12 on a 2×2 cell).
+        # Duplicate the orthogonal cell to exactly `total_pot_types` atoms, then
+        # assign the sublattice types by element order (each element's atoms take
+        # that element's block of type ids). Counting atoms via a manual parse
+        # avoids ase.io.read's StopIteration on LAMMPS write_data output
+        # (Velocities section + image flags).
+        num_atoms = len(_parse_lammps_cell_atoms_masses(ortho_cell.read_text(encoding='utf-8'))[1])
+        if num_atoms and total_pot_types % num_atoms == 0:
+            factor = total_pot_types // num_atoms
+            dup_factor_x, dup_factor_y = 1, 1
+            for factor_candidate in range(int(np.sqrt(factor)) + 1, 0, -1):
+                if factor % factor_candidate == 0:
+                    dup_factor_x = factor_candidate
+                    dup_factor_y = factor // factor_candidate
                     break
-            # Capture type→element mapping BEFORE duplication (# comments still present)
-            type_elem_map: Dict[int, str] = {}
-            for raw_line in ortho_cell.read_text(encoding='utf-8').splitlines():
-                stripped_line = raw_line.strip()
-                if '#' in stripped_line and stripped_line and stripped_line[0].isdigit():
-                    line_parts = stripped_line.split()
-                    try:
-                        type_id = int(line_parts[0])
-                        element_symbol = stripped_line.split('#')[-1].strip().split()[0]
-                        type_elem_map[type_id] = element_symbol
-                    except (ValueError, IndexError):
-                        pass
             dup_ortho = Path(tempfile.gettempdir()) / f"{config.mat}_{uuid.uuid4().hex[:8]}_dup.lmp"
             _duplicate_lammps_data(ortho_cell, dup_ortho, dup_factor_x, dup_factor_y, 1)
             ortho_cell.unlink()
             ortho_cell = dup_ortho
-            # Strip velocities and renumber using explicit type->element map.
-            # This avoids depending on ``# element`` Masses comments after
-            # LAMMPS write_data strips them.
-            _strip_velocities(ortho_cell)
-            renumber_atom_types(
-                ortho_cell,
-                pot=list(pot_counts.keys()),
-                type_to_element_map=type_elem_map
-            )
+            _assign_pot_types_by_order(ortho_cell, pot_element_order, pot_counts)
             dims = get_model_dimensions(ortho_cell)
 
     dims_calc = get_model_dimensions(ortho_cell)
@@ -1762,9 +1948,10 @@ def build_sheet(
     stacking_type: str = 'AB',
     edge_mode: str = 'none',
     edge_width: float = 0.0,
+    unit_cell_out: Optional[Dict[str, float]] = None,
 ) -> Tuple[Path, dict, Optional[float]]:
     """Build 2D material sheet (single or multi-layer).
-    
+
     Args:
         config: Sheet configuration.
         build_dir: Output directory.
@@ -1773,7 +1960,10 @@ def build_sheet(
         n_layers_override: Override layer count.
         use_pair_bonding: If True, use pair bonding stacking (for sheetonsheet).
         stacking_type: Stacking type ('AA' or 'AB'). AA has no shifts, AB has shifts.
-        
+        unit_cell_out: Optional mutable dict populated in-place with the
+            orthogonalized single-unit-cell bounds (xlo/xhi/ylo/yhi/...). Used by
+            PES scans to size the lateral grid to one surface lattice period.
+
     Returns:
         Tuple of (path, box_dims, lat_c).
     """
@@ -1782,6 +1972,8 @@ def build_sheet(
         edge_mode=edge_mode,
         edge_width=edge_width,
     )
+    if unit_cell_out is not None:
+        unit_cell_out.update({k: float(v) for k, v in supercell_dims.items()})
 
     n_layers = n_layers_override or (max(config.layers) if config.layers else 1)
     stacked_path = build_dir / f"{config.mat}_{n_layers}.lmp"

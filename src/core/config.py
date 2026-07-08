@@ -356,11 +356,15 @@ class GeneralConfig(BaseModel):
         )
     )
     scan_speed: Optional[Union[float, List[float]]] = 2.0
-    outer_loop: Optional[Literal['pressure', 'scan_speed']] = Field(
+    outer_loop: Optional[Literal['pressure', 'scan_speed', 'force']] = Field(
         None,
         description=(
-            "Parameter expanded as separate LAMMPS input files (slide_*.in). "
-            "If omitted, single-script behavior is used."
+            "Parameter expanded as separate LAMMPS slide input files "
+            "(slide_*.in), one per value, instead of a single in-script loop. "
+            "'pressure'/'scan_speed' apply to sheet-on-sheet runs; 'force' "
+            "applies to AFM runs (emits slide_f<load>N.in per load, all sharing "
+            "the single system.in indentation phase). If omitted, single-script "
+            "behavior is used."
         )
     )
     bond_spring: Optional[float] = Field(80.0, description="Spring constant for harmonically bonded sheets")
@@ -371,6 +375,66 @@ class GeneralConfig(BaseModel):
     )
 
 
+class PESConfig(BaseModel):
+    """Potential-energy-surface (PES) static lateral-scan parameters.
+
+    A PES scan replaces the dynamic sliding run with a cheap, static
+    energy-vs-lateral-position map over one surface unit cell (see
+    ``builders.pes_scan``). It is shared by both PES flavours:
+
+        - ``pes_sheet``: a frozen bilayer whose top layer is grid-scanned
+          laterally, relaxing only the out-of-plane coordinate at each point.
+        - ``pes_tip``: the AFM tip is grid-scanned laterally over the sheet
+          while the sheet + substrate relax; the lateral force on the tip is
+          recorded alongside the energy.
+
+    Attributes:
+        grid_n: Number of grid points per lattice vector (N in the N×N scan).
+        grid_n_refine: Optional finer grid for a convergence check. When set,
+            a second scan script at this resolution is also emitted.
+        z_relax: Sheet scan only — relax the top layer's z at each grid point
+            (relaxed PES). When False the layers stay rigid (rigid PES).
+        n_cells_x, n_cells_y: Optional explicit surface-cell tiling factors
+            spanned by the scan. When omitted the full periodic box (one built
+            supercell repeat) is scanned, which the builder normalizes per cell.
+    """
+    grid_n: int = Field(
+        default=12,
+        ge=2,
+        description="N for the N×N lateral grid over one surface unit cell.",
+    )
+    grid_n_refine: Optional[int] = Field(
+        default=None,
+        ge=2,
+        description="Optional finer grid resolution for a convergence check.",
+    )
+    z_relax: bool = Field(
+        default=True,
+        description="Sheet scan: relax top-layer z at each grid point (relaxed PES).",
+    )
+    tip_load: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Tip scan only — the single normal load (nN) at which the tip is pressed "
+            "into contact before scanning. The descriptor must be built at a STABLE "
+            "contact load: at ~2 nN the tip barely holds contact (the real sims are "
+            "near-random there), so the deployable scan uses a firm load in the "
+            "5-50 nN friction regime (default 30 nN, chosen data-drivenly as the "
+            "cof_std plateau / densest-sampled real load)."
+        ),
+    )
+    tip_load_sweep: Optional[List[float]] = Field(
+        default=None,
+        description=(
+            "Tip scan only — optional diagnostic list of loads (nN) to scan at, each "
+            "emitting its own script/grid (e.g. [2, 20, 30, 50]). Produces the "
+            "'descriptor predictive value climbs as it leaves the 2 nN pathology' "
+            "figure; not the deployable descriptor (that is the single tip_load)."
+        ),
+    )
+
+
 class AFMSimulationConfig(BaseModel):
     """Master configuration object for an AFM simulation run."""
     general: GeneralConfig
@@ -378,6 +442,7 @@ class AFMSimulationConfig(BaseModel):
     sub: SubstrateConfig
     sheet: SheetConfig = Field(..., alias='2D')
     flake: Optional[FlakeConfig] = Field(default=None, alias='flake')
+    pes: Optional[PESConfig] = Field(default=None, alias='pes')
     lj_override: Dict[str, Any] = Field(default_factory=dict, alias='lj_override')
     settings: GlobalSettings
 
@@ -436,6 +501,7 @@ class SheetOnSheetSimulationConfig(BaseModel):
     """Master configuration object for a Sheet-on-Sheet simulation run."""
     general: GeneralConfig
     sheet: SheetConfig = Field(..., alias='2D')
+    pes: Optional[PESConfig] = Field(default=None, alias='pes')
     lj_override: Dict[str, Any] = Field(default_factory=dict, alias='lj_override')
     settings: GlobalSettings
 

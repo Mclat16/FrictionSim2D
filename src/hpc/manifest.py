@@ -394,7 +394,7 @@ class JobManifest:
             rel_path = sim_path.relative_to(sim_dir)
             path_str = rel_path.as_posix()
             parts = rel_path.parts
-            material = parts[1] if len(parts) >= 2 and parts[0] in ('afm', 'sheetonsheet') else (parts[0] if parts else "")
+            material = parts[1] if len(parts) >= 2 and parts[0] in ('afm', 'sheetonsheet', 'pes_sheet', 'pes_tip') else (parts[0] if parts else "")
             layer_match = layer_pattern.search(path_str)
             layers = int(layer_match.group(1)) if layer_match else 1
             sim_directories.append({
@@ -433,18 +433,25 @@ class JobManifest:
                 continue
 
             for script_name in slide_scripts:
-                script_tag = Path(script_name).stem.replace('-', '_')
+                stem = Path(script_name).stem
+                script_tag = stem.replace('-', '_')
                 job_id = f"{sim_info['path_str']}_{script_tag}".replace('/', '_').replace('-', '_')
                 speed = 2.0
-                speed_match = re.match(r"slide_([0-9]+(?:p[0-9]+)?)ms", Path(script_name).stem)
+                speed_match = re.match(r"slide_([0-9]+(?:p[0-9]+)?)ms", stem)
                 if speed_match:
                     speed = float(speed_match.group(1).replace('p', '.'))
+                # Per-load slide scripts (AFM outer_loop=force): slide_f<load>N.in
+                force = 0.0
+                force_match = re.match(r"slide_f([0-9]+(?:p[0-9]+)?)N$", stem)
+                if force_match:
+                    force = float(force_match.group(1).replace('p', '.'))
                 manifest.add_job(JobEntry(
                     job_id=job_id,
                     simulation_path=str(sim_info['rel_path']),
                     lammps_script=script_name,
                     material=sim_info['material'],
                     layers=sim_info['layers'],
+                    force=force,
                     speed=speed,
                 ))
         return manifest

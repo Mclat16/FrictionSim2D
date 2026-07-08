@@ -7,7 +7,13 @@ attribute loading to avoid circular imports during startup.
 from importlib import import_module
 from typing import Any
 
-__all__ = ["AFMSimulation", "SheetOnSheetSimulation", "components"]
+__all__ = [
+    "AFMSimulation",
+    "SheetOnSheetSimulation",
+    "PESSheetSimulation",
+    "PESTipSimulation",
+    "components",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -15,6 +21,8 @@ def __getattr__(name: str) -> Any:
         return import_module(".afm", __name__).AFMSimulation
     if name == "SheetOnSheetSimulation":
         return import_module(".sheetonsheet", __name__).SheetOnSheetSimulation
+    if name in ("PESSheetSimulation", "PESTipSimulation"):
+        return getattr(import_module(".pes_scan", __name__), name)
     if name == "components":
         return import_module(".components", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

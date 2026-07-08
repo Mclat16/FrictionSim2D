@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .plot_data import Plotter
     from .read_data import DataReader
+    from . import pes_scan
 
 
 def __getattr__(name: str):
@@ -23,9 +24,13 @@ def __getattr__(name: str):
     if name == 'Plotter':
         from .plot_data import Plotter as _Plotter
         return _Plotter
+    if name == 'pes_scan':
+        import importlib
+        return importlib.import_module('.pes_scan', __name__)
     raise AttributeError(f"module {__name__!s} has no attribute {name!r}")
 
 __all__ = [
     'DataReader',
     'Plotter',
+    'pes_scan',
 ]

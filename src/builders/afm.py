@@ -12,7 +12,7 @@ from typing import Dict, Optional, Tuple
 from ..core.simulation_base import SimulationBase
 from ..core.config import AFMSimulationConfig
 from ..core.potential_manager import PotentialManager
-from ..core.utils import get_model_dimensions, normalize_potential_type
+from ..core.utils import get_model_dimensions, format_numeric_token, normalize_potential_type
 from ..data.models import EV_A_TO_NN
 from . import components
 
@@ -40,6 +40,7 @@ class AFMSimulation(SimulationBase):
         self.pm: Dict[int, PotentialManager] = {}
         self.lat_c: Optional[float] = None
         self.sheet_dims: Dict[str, float] = {}
+        self.sheet_unit_cell: Dict[str, float] = {}
         self.box_dims: Dict[str, float] = {}
         self.sheet_offset: Dict[str, float] = {'x': 0.0, 'y': 0.0}
         self.output_dir_layer: Dict[int, Path] = {}
@@ -75,6 +76,7 @@ class AFMSimulation(SimulationBase):
                         if self.config.general.finite_sheet else 'none'
                     ),
                     edge_width=self.config.settings.geometry.finite_sheet_edge_width,
+                    unit_cell_out=self.sheet_unit_cell,
             )
             self.sheet_paths[n_layers] = sheet_path
             if self.lat_c is None:
@@ -356,14 +358,19 @@ class AFMSimulation(SimulationBase):
 
         return pm
 
-    def write_inputs(self, n_layers: int) -> None:
-        """Generates the LAMMPS input scripts.
-        
+    def build_render_context(self, n_layers: int) -> Dict[str, object]:
+        """Assemble the Jinja render context for one layer configuration.
+
+        Split out from :meth:`write_inputs` so alternative scripts (e.g. the
+        static PES tip scan) can reuse the identical geometry/potential context
+        and only swap the rendered template.
+
         Args:
             n_layers: Number of sheet layers for this configuration.
-        """
-        logger.info("Writing LAMMPS inputs...")
 
+        Returns:
+            The template context dict shared by ``system_init``/``slide`` scripts.
+        """
         pm = self.pm[n_layers]
         box_dims = self.box_dims
         sheet_offset = self.sheet_offset
@@ -515,11 +522,53 @@ class AFMSimulation(SimulationBase):
             'finite_sheet_edge_spring_k': self.config.settings.geometry.finite_sheet_edge_spring_k,
         }
         context.update(flake_ctx)
+        return context
 
+    def write_inputs(self, n_layers: int) -> None:
+        """Generates the LAMMPS input scripts.
+
+        Args:
+            n_layers: Number of sheet layers for this configuration.
+        """
+        logger.info("Writing LAMMPS inputs...")
+
+        context = self.build_render_context(n_layers)
+        output_root = self.output_dir_layer[n_layers]
+
+        # The single system.in always keeps the full force list so it writes
+        # every load_<X>N.data file the slide phase(s) read.
         init_script = self.render_template("afm/system_init.lmp", context)
-        self.write_file("lammps/system.in", init_script, self.output_dir_layer[n_layers])
+        self.write_file("lammps/system.in", init_script, output_root)
+
+        self._write_slide_scripts(context, output_root)
+
+        logger.info("Inputs written to %s/lammps/", output_root)
+
+    def _write_slide_scripts(self, context: Dict, output_root: Path) -> None:
+        """Write the slide phase script(s).
+
+        With ``outer_loop = force`` (and more than one load) each load is emitted
+        as its own ``slide_f<load>N.in`` reading its shared ``load_<load>N.data``,
+        mirroring the sheet-on-sheet ``outer_loop`` split. Each becomes an
+        independent HPC job (the two-phase generator makes them depend on the
+        shared system.in phase). Otherwise a single ``slide.in`` loops over the
+        loads in-script, as before.
+        """
+        outer_loop = getattr(self.config.general, 'outer_loop', None)
+        force = self.config.general.force
+        forces = force if isinstance(force, list) else ([] if force is None else [force])
+
+        # Keep a single load on slide.in so the combined system+slide HPC path
+        # (which references the literal name slide.in) still applies.
+        if outer_loop == 'force' and len(forces) > 1:
+            for load in forces:
+                slide_context = dict(context)
+                slide_context['forces'] = load
+                script = self.render_template("afm/slide.lmp", slide_context)
+                script_name = f"slide_f{format_numeric_token(float(load))}N.in"
+                self.write_file(f"lammps/{script_name}", script, output_root)
+            logger.info("Split slide phase into %d per-load scripts.", len(forces))
+            return
 
         slide_script = self.render_template("afm/slide.lmp", context)
-        self.write_file("lammps/slide.in", slide_script, self.output_dir_layer[n_layers])
-
-        logger.info("Inputs written to %s/lammps/", self.output_dir_layer[n_layers])
+        self.write_file("lammps/slide.in", slide_script, output_root)

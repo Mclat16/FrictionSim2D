@@ -1,0 +1,85 @@
+# LAMMPS input script for Sheet-on-Sheet interlayer PES scan
+# Static energy-vs-lateral-position map over one surface unit cell.
+#   - Bottom layer (layer_1) frozen.
+#   - Top layer (layer_2) rigid in-plane, grid-scanned laterally.
+#   - At each (dx, dy){% if z_relax %} the out-of-plane (z) coordinates relax{% else %} the layers stay rigid{% endif %}, then the
+#     total potential energy is recorded (normalized per surface unit cell).
+# No dynamics, no thermostat, no sliding: each grid point is one energy evaluation.
+
+clear
+units           metal
+atom_style      {{ atom_style }}
+boundary        p p p
+
+neighbor        {{ neighbor_list }} bin
+{{ neigh_modify_command }}
+comm_style      tiled
+
+read_data       {{ data_file }}
+include         {{ potential_file }}
+
+{% if pot_type == 'reaxff' %}
+fix             qeq all qeq/reaxff 1 0.0 10.0 1.0e-6 reaxff
+{% elif pot_type == 'reax/c' %}
+fix             qeq all qeq/reax 1 0.0 10.0 1.0e-6 reax/c
+{% endif %}
+
+# layer_1 (bottom) and layer_2 (top) groups are defined in system.in.settings.
+velocity        layer_1 set 0.0 0.0 0.0 units box
+velocity        layer_2 set 0.0 0.0 0.0 units box
+
+# Bottom layer fully frozen; top layer held rigid in-plane.
+fix             freeze_bottom layer_1 setforce 0.0 0.0 0.0
+{% if z_relax %}
+# setforce with a NULL z-component leaves the top layer free to relax out-of-plane.
+fix             top_inplane layer_2 setforce 0.0 0.0 NULL
+{% else %}
+fix             top_inplane layer_2 setforce 0.0 0.0 0.0
+{% endif %}
+
+min_style       {{ min_style }}
+timestep        {{ timestep }}
+thermo          {{ thermo }}
+
+# --- lateral scan grid over one surface unit cell -----------------------------
+variable        Nx     equal {{ grid_n }}
+variable        Ny     equal {{ grid_n }}
+variable        Lx     equal {{ period_x }}
+variable        Ly     equal {{ period_y }}
+variable        ncell  equal {{ n_cells }}
+variable        dxstep equal v_Lx/v_Nx
+variable        dystep equal v_Ly/v_Ny
+
+# Energy is normalized per surface unit cell so materials are comparable.
+variable        pe_cell equal pe/v_ncell
+
+# CSV: dx, dy in Angstrom (top-layer displacement); energy_eV per surface cell.
+print           "dx,dy,energy_eV" file {{ results_csv }} screen no
+
+# We only ever move the top layer by the delta from the previous grid point to
+# the current one, so the xy positions stay exactly on the grid (z relaxation
+# never touches xy) and periodic wrap-around is harmless. prev_dx/prev_dy are
+# snapshotted with immediate $(...) evaluation each step: `variable ... equal v_dx`
+# would be re-evaluated lazily (always == current dx), making the delta always 0.
+variable        prev_dx equal 0.0
+variable        prev_dy equal 0.0
+
+variable        ix loop ${Nx}
+label           loop_ix
+variable        iy loop ${Ny}
+label           loop_iy
+variable        dx equal (v_ix-1)*v_dxstep
+variable        dy equal (v_iy-1)*v_dystep
+displace_atoms  layer_2 move $(v_dx-v_prev_dx) $(v_dy-v_prev_dy) 0.0 units box
+variable        prev_dx equal $(v_dx)
+variable        prev_dy equal $(v_dy)
+{% if z_relax %}
+{{ minimization_command }}
+{% else %}
+run             0
+{% endif %}
+print           "$(v_dx),$(v_dy),$(v_pe_cell)" append {{ results_csv }} screen no
+next            iy
+jump            SELF loop_iy
+next            ix
+jump            SELF loop_ix
