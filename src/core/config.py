@@ -21,6 +21,15 @@ class GeometrySettings(BaseModel):
     tip_reduction_factor: float = 2.25
     rigid_tip: bool = False
     tip_base_z: float = 55.0
+    tip_start_clearance: float = Field(
+        default=20.0,
+        description=(
+            "Vertical clearance (Angstrom) placed above the contact gap so the tip "
+            "starts clear of the surface during equilibration. After equilibration the "
+            "indentation script lowers the tip by a measured amount so its lowest atom "
+            "sits exactly the contact gap above the indented surface."
+        ),
+    )
     lat_c_default: float = 6.0
     finite_sheet_edge_width: float = Field(
         default=4.0,

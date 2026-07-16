@@ -206,7 +206,7 @@ def _make_flake_builder(tmp_path: Path) -> AFMSimulation:
     builder.relative_run_dir_layer[1] = builder.relative_run_dir / "L1"
     (builder.output_dir_layer[1] / "lammps").mkdir(parents=True, exist_ok=True)
 
-    builder.z_positions[1] = {'sub': 0.0, 'sheet': 12.0, 'flake': 18.0, 'tip': 40.0}
+    builder.z_positions[1] = {'sub': 0.0, 'sheet': 12.0, 'flake': 18.0, 'tip': 40.0, 'tip_contact_gap': 3.5}
     builder.groups[1] = {
         'sub_types': '1 2',
         'tip_types': '3',

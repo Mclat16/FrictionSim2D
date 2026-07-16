@@ -201,7 +201,7 @@ def _prepare_builder_for_slide_write(builder: AFMSimulation, tmp_path: Path) -> 
     builder.tip_path = tmp_path / "tip.lmp"
     builder.sub_path = tmp_path / "sub.lmp"
 
-    builder.z_positions[1] = {"sub": 0.0, "sheet": 16.0, "tip": 40.0}
+    builder.z_positions[1] = {"sub": 0.0, "sheet": 16.0, "tip": 40.0, "tip_contact_gap": 3.5}
     builder.groups[1] = {
         "sub_types": "1",
         "tip_types": "2",

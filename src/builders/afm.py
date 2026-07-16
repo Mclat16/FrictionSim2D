@@ -253,6 +253,13 @@ class AFMSimulation(SimulationBase):
         sheet_stack_height = (n_layers - 1) * lat_c
         sheet_top_z = sheet_base_z + sheet_stack_height
 
+        # The tip is placed a fixed clearance ABOVE its intended contact gap so it
+        # equilibrates clear of the surface; the indentation script then lowers it by
+        # a live-measured amount to sit exactly ``contact_gap`` above the surface it
+        # indents (the flake if present, else the top sheet). ``contact_gap`` is the
+        # material-derived gap, so "how close the tip lands" is computed, not hardcoded.
+        start_clearance = self.config.settings.geometry.tip_start_clearance
+
         if self.config.flake is not None:
             # Flake sits above the top sheet; the tip then sits above the flake.
             gap_sheet_flake = pm.calculate_gap('sheet', 'flake', buffer=0.5)
@@ -264,18 +271,23 @@ class AFMSimulation(SimulationBase):
                 0.0,
                 (self.flake_dims.get('zhi', 0.0) - self.flake_dims.get('zlo', 0.0)) - 2.0,
             )
-            tip_z = flake_z + flake_thickness + gap_flake_tip + tip_radius
+            contact_gap = gap_flake_tip
+            tip_z = flake_z + flake_thickness + gap_flake_tip + tip_radius + start_clearance
             logger.info(
-                "Calculated gaps: Sub-Sheet=%.2fA, Sheet-Flake=%.2fA, Flake-Tip=%.2fA",
-                gap_sub_sheet, gap_sheet_flake, gap_flake_tip,
+                "Calculated gaps: Sub-Sheet=%.2fA, Sheet-Flake=%.2fA, Flake-Tip=%.2fA "
+                "(tip start clearance %.1fA)",
+                gap_sub_sheet, gap_sheet_flake, gap_flake_tip, start_clearance,
             )
         else:
             gap_sheet_tip = pm.calculate_gap('sheet', 'tip', buffer=0.5)
-            tip_z = sheet_top_z + gap_sheet_tip + tip_radius
-            logger.info("Calculated gaps: Sub-Sheet=%.2fA, Sheet-Tip=%.2fA",
-                        gap_sub_sheet, gap_sheet_tip)
+            contact_gap = gap_sheet_tip
+            tip_z = sheet_top_z + gap_sheet_tip + tip_radius + start_clearance
+            logger.info("Calculated gaps: Sub-Sheet=%.2fA, Sheet-Tip=%.2fA "
+                        "(tip start clearance %.1fA)",
+                        gap_sub_sheet, gap_sheet_tip, start_clearance)
 
         self.z_positions[n_layers]['tip'] = tip_z
+        self.z_positions[n_layers]['tip_contact_gap'] = contact_gap
 
     def _generate_potentials(
         self,
@@ -472,6 +484,7 @@ class AFMSimulation(SimulationBase):
             'tip_x': tip_x,
             'tip_y': tip_y,
             'tip_z': tip_z,
+            'contact_gap': z_positions['tip_contact_gap'],
             'sheet_shift_x': sheet_offset['x'],
             'sheet_shift_y': sheet_offset['y'],
             'sheet_z': z_positions['sheet'],

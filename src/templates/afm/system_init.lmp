@@ -30,6 +30,28 @@ dump            sys all atom {{ dump_freq }} {{ dump_file }}
 min_style       {{ min_style }}
 {{ minimization_command }}
 
+# --- Approach: lower the tip from its clear start height to the computed contact gap
+# above the surface it indents (the flake if present, else the top sheet). Done on the
+# freshly minimized geometry, BEFORE any dynamics — so a thermally desorbed outlier
+# atom can never corrupt the reduce-max surface measurement (mirrors the PES approach).
+# Measured live (tip-bottom minus surface-top) so it self-adjusts to tip radius,
+# material and stack height instead of assuming a fixed drop. The computes are named in
+# thermo_style + a zero-step run so LAMMPS actually evaluates them before the approach
+# variable reads them (a compute used only by an equal-style variable is never current).
+compute         cz_tip tip_all reduce min z
+{% if flake_enabled %}
+compute         cz_surf flake_all reduce max z
+{% else %}
+compute         cz_surf 2D_all reduce max z
+{% endif %}
+thermo_style    custom step pe c_cz_tip c_cz_surf
+run             0
+variable        approach equal (c_cz_tip-c_cz_surf)-{{ contact_gap }}
+displace_atoms  tip_all move 0.0 0.0 $(-v_approach) units box
+thermo_style    one
+uncompute       cz_tip
+uncompute       cz_surf
+
 {% if finite_sheet_enabled and finite_sheet_edge_mode == 'spring' %}
 group           sheet_edge intersect 2D 2D_edge
 fix             fs_edge sheet_edge spring/self {{ finite_sheet_edge_spring_k }} xy
@@ -75,8 +97,6 @@ fix             corner_hold flake_corner spring/self {{ flake_corner_k }} xy
 fix             tip_f {{ tip_fix_group }} rigid/nve single force * off off off torque * off off off
 run             10000
 unfix           tip_f
-
-displace_atoms  tip_all move 0.0 0.0 -20.0 units box
 
 fix             tip_f {{ tip_fix_group }} rigid/nve single force * off off on torque * off off off
 variable        f equal 0.0
