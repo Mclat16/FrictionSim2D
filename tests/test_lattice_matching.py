@@ -5,6 +5,7 @@ from typing import Tuple
 import numpy as np
 import pytest
 
+from src.core.config import LatticeMatchConfig
 from src.core.lattice_matching import (
     MatchResult,
     StackingResult,
@@ -236,7 +237,6 @@ loop_
 # LatticeMatchConfig
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="LatticeMatchConfig wired in Task 2")
 class TestLatticeMatchConfig:
     def test_defaults(self):
         cfg = LatticeMatchConfig()

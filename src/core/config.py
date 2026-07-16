@@ -444,6 +444,14 @@ class PESConfig(BaseModel):
     )
 
 
+class LatticeMatchConfig(BaseModel):
+    """Lattice-matching parameters for heterostructure interfaces."""
+    method: str = 'zur_mcgill'
+    strain_tol: float = Field(default=0.02, ge=0.0, le=1.0)
+    max_supercell: int = Field(default=10, ge=1)
+    area_tol: float = 0.10
+
+
 class AFMSimulationConfig(BaseModel):
     """Master configuration object for an AFM simulation run."""
     general: GeneralConfig
@@ -508,6 +516,7 @@ class AFMSimulationConfig(BaseModel):
 
 class SheetOnSheetSimulationConfig(BaseModel):
     """Master configuration object for a Sheet-on-Sheet simulation run."""
+    lattice_match: Optional[LatticeMatchConfig] = Field(default=None, alias='lattice_match')
     general: GeneralConfig
     sheet: SheetConfig = Field(..., alias='2D')
     pes: Optional[PESConfig] = Field(default=None, alias='pes')

@@ -345,3 +345,18 @@ def test_settings_origin_returns_explicit_path(tmp_path, monkeypatch):
     monkeypatch.setattr('src.core.config._global_settings_path', lambda: global_path)
 
     assert settings_origin(settings_file=explicit_path) == explicit_path
+
+
+def test_lattice_match_section_is_parsed(tmp_path):
+    from src.core.config import LatticeMatchConfig
+    lm = LatticeMatchConfig()
+    assert lm.method == "zur_mcgill"
+    assert lm.strain_tol == 0.02
+    assert lm.max_supercell == 10
+    assert lm.area_tol == 0.10
+    # out-of-range values are rejected
+    import pytest
+    with pytest.raises(Exception):
+        LatticeMatchConfig(strain_tol=2.0)   # > 1.0
+    with pytest.raises(Exception):
+        LatticeMatchConfig(max_supercell=0)  # < 1
