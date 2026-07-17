@@ -30,6 +30,15 @@ class FreestandingPESTipSimulation(PESTipSimulation):
         pes = getattr(self.config, 'pes', None)
         return int(getattr(pes, 'md_steps', 2000)) if pes is not None else 2000
 
+    def _log_resolved_config(self, n_layers: int) -> None:
+        pes = getattr(self.config, 'pes', None)
+        load = getattr(pes, 'tip_load', None) if pes is not None else None
+        logger.info(
+            "Resolved: freestanding tip PES | %d-layer slab | no substrate | "
+            "eval_mode=%s | target load=%s nN",
+            n_layers, self._eval_mode(), load,
+        )
+
     def write_inputs(self, n_layers: int) -> None:
         """Render the freestanding tip PES scan to ``lammps/slide.in``."""
         logger.info("Writing freestanding tip PES scan inputs...")
@@ -39,6 +48,8 @@ class FreestandingPESTipSimulation(PESTipSimulation):
                 "A freestanding tip PES needs a fixed bottom layer + at least one "
                 f"relaxed layer; set [2D] layers >= 2 (got {n_layers})."
             )
+
+        self._log_resolved_config(n_layers)
 
         context = self.build_render_context(n_layers)
         rel_layer = str(self.relative_run_dir_layer[n_layers])

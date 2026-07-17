@@ -90,3 +90,11 @@ def test_freestanding_md_mode_emits_langevin_and_run(tmp_path, monkeypatch):
     assert "langevin" in slide and "layer_2" in slide
     assert "run             2000" in slide
     assert "fix_ave" in slide or "ave/time" in slide  # per-point time averaging
+
+
+def test_freestanding_logs_resolved_config(tmp_path, caplog):
+    import logging
+    builder = FreestandingPESTipSimulation(_free_cfg(tmp_path, layers=(4,)), output_dir=str(tmp_path / "o"))
+    with caplog.at_level(logging.INFO):
+        builder._log_resolved_config(4)
+    assert any("freestanding" in r.message.lower() and "4-layer" in r.message for r in caplog.records)
