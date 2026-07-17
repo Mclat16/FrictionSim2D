@@ -20,6 +20,7 @@ from .config import (
 )
 from .path_utils import format_dimension_token
 from ..builders.afm import AFMSimulation
+from ..builders.afm_freestanding import FreestandingPESTipSimulation
 from ..builders.sheetonsheet import SheetOnSheetSimulation
 from ..builders.pes_scan import PESSheetSimulation, PESTipSimulation
 from ..builders.indent import IndentSimulation
@@ -330,6 +331,15 @@ def generate_hpc_scripts_for_root(simulation_root: Path, settings) -> None:
     )
 
 
+def _select_afm_builder_cls(model, config_obj):
+    """Pick the builder class, routing substrate-free configs to freestanding."""
+    afm_builders = {'pes_tip': PESTipSimulation, 'indent': IndentSimulation}
+    default_cls = afm_builders.get(model, AFMSimulation)
+    if getattr(config_obj, 'sub', None) is None:
+        return {'pes_tip': FreestandingPESTipSimulation}.get(model, default_cls)
+    return default_cls
+
+
 def run_simulations(
     config_file: str,
     model: str,
@@ -422,8 +432,7 @@ def run_simulations(
                 config_obj = AFMSimulationConfig(**run_dict)
                 config_json_path = prov_dir / 'config.json'
                 config_json_path.write_text(config_obj.model_dump_json(indent=2), encoding='utf-8')
-                afm_builders = {'pes_tip': PESTipSimulation, 'indent': IndentSimulation}
-                builder_cls = afm_builders.get(model, AFMSimulation)
+                builder_cls = _select_afm_builder_cls(model, config_obj)
                 builder = builder_cls(config_obj, output_dir, config_path=str(config_json_path))
             else:
                 config_obj = SheetOnSheetSimulationConfig(**run_dict)

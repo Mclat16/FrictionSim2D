@@ -345,3 +345,17 @@ def test_run_simulations_raises_for_missing_config_file(tmp_path: Path) -> None:
             model="afm",
             output_root=tmp_path,
         )
+
+
+def test_pes_tip_no_substrate_selects_freestanding_builder():
+    from src.core.run import _select_afm_builder_cls
+    from src.builders.afm_freestanding import FreestandingPESTipSimulation
+    from src.builders.pes_scan import PESTipSimulation
+
+    class _Cfg:  # minimal stand-in with the only attribute the selector reads
+        sub = None
+    assert _select_afm_builder_cls('pes_tip', _Cfg()) is FreestandingPESTipSimulation
+
+    class _CfgSub:
+        sub = object()
+    assert _select_afm_builder_cls('pes_tip', _CfgSub()) is PESTipSimulation
