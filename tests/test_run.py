@@ -189,6 +189,7 @@ def test_run_simulations_dispatches_afm_and_generates_hpc(
     class FakeConfig:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.sub = kwargs.get('sub')
 
         def model_dump_json(self, indent=2):
             return "{}"
@@ -305,6 +306,7 @@ def test_run_simulations_continues_after_build_failure(
     class FakeConfig:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.sub = kwargs.get('sub')
 
         def model_dump_json(self, indent=2):
             return "{}"
@@ -359,3 +361,12 @@ def test_pes_tip_no_substrate_selects_freestanding_builder():
     class _CfgSub:
         sub = object()
     assert _select_afm_builder_cls('pes_tip', _CfgSub()) is PESTipSimulation
+
+
+def test_afm_no_substrate_raises():
+    from src.core.run import _select_afm_builder_cls
+    import pytest
+    class _Cfg:
+        sub = None
+    with pytest.raises(ValueError, match="substrate-free"):
+        _select_afm_builder_cls('afm', _Cfg())

@@ -55,8 +55,8 @@ fix             lang_band layer_2 langevin {{ temp }} {{ temp }} $(100.0*dt) 482
 fix_modify      lang_band temp t_band
 reset_timestep  0
 fix             ave_pe all ave/time 1 {{ md_steps }} {{ md_steps }} v_fx v_fy v_fz c_thermo_pe mode scalar
-{% endif %}
 
+{% endif %}
 # --- lateral scan grid over one surface unit cell --------------------------------
 variable        Nx     equal {{ grid_n }}
 variable        Ny     equal {{ grid_n }}

@@ -331,12 +331,36 @@ def generate_hpc_scripts_for_root(simulation_root: Path, settings) -> None:
     )
 
 
+class FreestandingConfigError(ValueError):
+    """A substrate-free config was used with a model lacking a freestanding builder.
+
+    Raised by :func:`_select_afm_builder_cls` and deliberately NOT caught by
+    ``run_simulations``'s per-config broad-except (which exists to let a
+    material/parameter sweep continue past isolated build failures) — this is
+    a hard misconfiguration, not a recoverable per-config build error, so it
+    must propagate and abort the whole run.
+    """
+
+
 def _select_afm_builder_cls(model, config_obj):
-    """Pick the builder class, routing substrate-free configs to freestanding."""
+    """Pick the builder class, routing substrate-free configs to freestanding.
+
+    A substrate-free config (no ``[sub]`` section) is only supported today for
+    the freestanding tip PES scan. Freestanding dynamic slide/indent is a
+    future (Phase 2) feature, so any other model without a substrate is a
+    hard error rather than a silently broken build.
+    """
     afm_builders = {'pes_tip': PESTipSimulation, 'indent': IndentSimulation}
     default_cls = afm_builders.get(model, AFMSimulation)
     if getattr(config_obj, 'sub', None) is None:
-        return {'pes_tip': FreestandingPESTipSimulation}.get(model, default_cls)
+        freestanding = {'pes_tip': FreestandingPESTipSimulation}
+        if model in freestanding:
+            return freestanding[model]
+        raise FreestandingConfigError(
+            f"A substrate-free config (no [sub] section) is only supported for "
+            f"'pes-tip' (the freestanding tip PES). Model '{model}' requires a [sub] "
+            f"section; freestanding dynamic slide/indent is a future (Phase 2) feature."
+        )
     return default_cls
 
 
@@ -445,6 +469,11 @@ def run_simulations(
             builder.build()
             created_simulations.append(output_dir)
 
+        except FreestandingConfigError:
+            # Hard misconfiguration (substrate-free config on a model with no
+            # freestanding builder) — abort the whole run instead of silently
+            # skipping this config and reporting a false "N/M successful".
+            raise
         except Exception as exc:  # pylint: disable=broad-except
             logger.error("Build failed for %s: %s", output_dir, exc)
             continue

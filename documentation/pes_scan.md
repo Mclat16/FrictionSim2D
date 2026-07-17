@@ -99,7 +99,8 @@ z_relax = true       # sheet scan: relax the top layer's z at each grid point
   corrugation is clearest before ploughing sets in.
 
 Runnable examples: [../examples/pes_sheet_config.ini](../examples/pes_sheet_config.ini),
-[../examples/pes_tip_config.ini](../examples/pes_tip_config.ini).
+[../examples/pes_tip_config.ini](../examples/pes_tip_config.ini),
+[../examples/afm_freestanding_pes_config.ini](../examples/afm_freestanding_pes_config.ini) (freestanding tip PES).
 
 ```bash
 FrictionSim2D run pes-sheet examples/pes_sheet_config.ini -o ./pes_output --hpc-scripts
