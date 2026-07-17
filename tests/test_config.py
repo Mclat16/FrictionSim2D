@@ -4,10 +4,11 @@ import yaml
 from pathlib import Path
 from pydantic import ValidationError
 from src.core.config import (
-    AFMSimulationConfig, 
+    AFMSimulationConfig,
+    PESConfig,
     SheetOnSheetSimulationConfig,
-    TipConfig, 
-    SheetConfig, 
+    TipConfig,
+    SheetConfig,
     SubstrateConfig,
     GeneralConfig,
     GlobalSettings,
@@ -260,6 +261,57 @@ def test_non_finite_sheet_rejects_crystalline_substrate(tmp_path, monkeypatch):
             **{'2D': VALID_SHEET},
             settings=settings,
         )
+
+
+# ---------------------------------------------------------------------------
+# PES eval-mode and optional substrate tests
+# ---------------------------------------------------------------------------
+
+def _afm_dict(tmp_path, include_sub=True, sub_amorph="a", finite_sheet=False, pes=None):
+    pot = tmp_path / "d.sw"; pot.write_text("# pot", encoding="utf-8")
+    cif = tmp_path / "d.cif"; cif.write_text("# cif", encoding="utf-8")
+    d = {
+        "general": {"temp": 300.0, "force": [2.0], "scan_speed": 2.0, "finite_sheet": finite_sheet},
+        "2D": {"mat": "h-MoS2", "pot_type": "sw", "pot_path": str(pot),
+               "cif_path": str(cif), "x": 60.0, "y": 60.0, "layers": [4]},
+        "tip": {"mat": "Si", "pot_type": "sw", "pot_path": str(pot),
+                "cif_path": str(cif), "r": 25.0, "amorph": "c"},
+        "settings": load_settings().model_dump(),
+    }
+    if include_sub:
+        d["sub"] = {"mat": "Si", "pot_type": "sw", "pot_path": str(pot),
+                    "cif_path": str(cif), "thickness": 12.0, "amorph": sub_amorph}
+    if pes is not None:
+        d["pes"] = pes
+    return d
+
+
+def test_pes_eval_mode_defaults_minimize():
+    assert PESConfig().eval_mode == "minimize"
+    assert PESConfig().md_steps == 2000
+
+
+def test_pes_eval_mode_md_parses():
+    cfg = PESConfig(eval_mode="md", md_steps=500)
+    assert cfg.eval_mode == "md"
+    assert cfg.md_steps == 500
+
+
+def test_afm_config_sub_optional(tmp_path):
+    cfg = AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=False))
+    assert cfg.sub is None
+
+
+def test_afm_config_freestanding_skips_amorph_requirement(tmp_path):
+    # No [sub] + non-finite must NOT raise the amorphous-substrate error.
+    cfg = AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=False, finite_sheet=False))
+    assert cfg.sub is None
+
+
+def test_afm_config_nonamorph_sub_still_rejected(tmp_path):
+    import pytest
+    with pytest.raises(ValueError, match="amorphous substrate"):
+        AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=True, sub_amorph="c", finite_sheet=False))
 
 
 # ---------------------------------------------------------------------------

@@ -469,6 +469,20 @@ class PESConfig(BaseModel):
             "the M-cell travel (the builder warns if not)."
         ),
     )
+    eval_mode: Literal['minimize', 'md'] = Field(
+        default='minimize',
+        description=(
+            "Tip freestanding scan only — how each grid point is evaluated. "
+            "'minimize' = static energy minimization (0 K, cheapest). 'md' = a short "
+            "NVE + Langevin run of md_steps with the layer_2 thermostat band active, "
+            "time-averaging energy/force (a finite-T PES / potential of mean force)."
+        ),
+    )
+    md_steps: int = Field(
+        default=2000,
+        ge=1,
+        description="Steps per grid point when eval_mode = 'md' (ignored for 'minimize').",
+    )
 
 
 class IndentConfig(BaseModel):
@@ -549,7 +563,7 @@ class AFMSimulationConfig(BaseModel):
     """Master configuration object for an AFM simulation run."""
     general: GeneralConfig
     tip: TipConfig
-    sub: SubstrateConfig
+    sub: Optional[SubstrateConfig] = Field(default=None, alias='sub')
     sheet: SheetConfig = Field(..., alias='2D')
     flake: Optional[FlakeConfig] = Field(default=None, alias='flake')
     pes: Optional[PESConfig] = Field(default=None, alias='pes')
@@ -559,8 +573,12 @@ class AFMSimulationConfig(BaseModel):
 
     @model_validator(mode='after')
     def validate_non_finite_sheet_substrate(self) -> 'AFMSimulationConfig':
-        """Require amorphous substrate when AFM finite-sheet mode is disabled."""
-        if not self.general.finite_sheet and self.sub.amorph != 'a':
+        """Require amorphous substrate for a substrate-backed non-finite-sheet AFM.
+
+        A freestanding run (no [sub] section, self.sub is None) has no substrate to
+        constrain, so the amorphous requirement does not apply.
+        """
+        if self.sub is not None and not self.general.finite_sheet and self.sub.amorph != 'a':
             raise ValueError(
                 "Non-finite-sheet AFM requires an amorphous substrate "
                 "(set [sub] amorph = a)."
@@ -571,6 +589,9 @@ class AFMSimulationConfig(BaseModel):
     def validate_finite_sheet_geometry(self) -> 'AFMSimulationConfig':
         """Validate finite-sheet substrate sizing against the sheet footprint."""
         if not self.general.finite_sheet:
+            return self
+
+        if self.sub is None:
             return self
 
         if self.sub.x is None or self.sub.y is None:
