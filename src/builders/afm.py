@@ -37,7 +37,7 @@ class AFMSimulation(SimulationBase):
         self.config: AFMSimulationConfig = config
         self.sheet_paths: Dict[int, Path] = {}
         self.tip_path: Path
-        self.sub_path: Path
+        self.sub_path: Optional[Path]
         self.flake_path: Optional[Path] = None
         self.flake_dims: Dict[str, float] = {}
         self.z_positions: Dict[int, Dict[str, float]] = {}
@@ -142,7 +142,7 @@ class AFMSimulation(SimulationBase):
         Sheet is built separately for each layer count.
         
         Returns:
-            Tuple of (tip_path, tip_radius, sub_path).
+            Tuple of (tip_path, tip_radius, sub_path); sub_path is None when config.sub is None (freestanding).
         """
         tip_path, tip_radius = components.build_tip(
             self.config.tip, build_dir, self.config.settings

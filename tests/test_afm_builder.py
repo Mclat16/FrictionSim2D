@@ -425,7 +425,13 @@ def test_provenance_skips_absent_substrate(tmp_path):
     from src.builders.afm import AFMSimulation
     cfg = _freestanding_afm_cfg(tmp_path)
     builder = AFMSimulation(cfg, output_dir=str(tmp_path / "o"))
-    # _init_provenance must not attempt to read a None substrate config, and it
-    # must still create the provenance folder for the present components.
+
+    # Spy on which components get recorded: the guard must SKIP the absent
+    # substrate while still recording the present components. This fails if the
+    # guard is removed (i.e. ('sub', None) is passed unconditionally).
+    seen = []
+    builder._add_component_files_to_provenance = lambda name, config: seen.append(name)
+
     builder._init_provenance()  # must not raise on a None substrate
-    assert (builder.output_dir / "provenance").is_dir()
+    assert "sub" not in seen
+    assert {"sheet", "tip"} <= set(seen)
