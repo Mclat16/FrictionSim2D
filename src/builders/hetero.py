@@ -46,7 +46,9 @@ from ase.build import make_supercell
 from ase.data import atomic_masses, atomic_numbers, chemical_symbols
 from ase.io import read, write
 
+from ..core.config import GlobalSettings, SheetConfig
 from ..core.lattice_matching import MatchResult, _max_strain, find_coincidence_lattice
+from ..core.potential_manager import PotentialManager
 
 PathLike = Union[str, Path]
 
@@ -80,6 +82,129 @@ class MatchedStack:
     strain_reference: float
     strain_applied: float
     match: MatchResult = field(default=None)  # type: ignore[assignment]
+
+
+@dataclass
+class HeteroPotentials:
+    """Registered potential spine for a stacked heterostructure.
+
+    Every material is its own :class:`PotentialManager` component with a
+    disjoint, contiguous block of global LAMMPS atom-type IDs, its own
+    many-body potential inside a single ``pair_style hybrid``, and UFF-mixed
+    ``lj/cut`` cross-terms for every A-B element pair at the interface -- all
+    emitted into ``system.in.settings``.
+
+    Attributes:
+        pm: The configured :class:`PotentialManager` (type registry +
+            interactions already written).
+        settings_path: Path to the written ``system.in.settings``.
+        component_names: Component name per material, in stacking order
+            (``['sheet_1', 'sheet_2', ...]``).
+        type_ids: Per-material list of that material's global atom-type IDs, in
+            stacking order. Read straight from the PM type registry
+            (``pm.types.ids_by_component``); never hand-assigned. The blocks are
+            disjoint and together cover ``1..len(pm.types)`` with no gaps.
+        type_offsets: Per-material starting type offset (0-based) = the number
+            of types registered before that material = ``type_ids[i][0] - 1``.
+            Task 4 feeds this to ``read_data ... add append offset <k>`` so the
+            assembled data file's atom types line up with this PM exactly.
+    """
+    pm: PotentialManager
+    settings_path: Path
+    component_names: List[str]
+    type_ids: List[List[int]]
+    type_offsets: List[int]
+
+
+def register_hetero_potentials(
+    sheets: List[SheetConfig],
+    settings: GlobalSettings,
+    workdir: PathLike,
+) -> HeteroPotentials:
+    """Register the stacked materials as PotentialManager components.
+
+    This is the component/atom-type spine of the heterostructure: it is
+    geometry-independent (it needs only the per-material configs, not any
+    assembled data file), so it runs *before* stack assembly -- assembly then
+    uses the returned potential to minimize the interface spacing, and reads
+    ``type_offsets`` to keep the assembled data file's atom types aligned with
+    this PM.
+
+    Each material ``sheets[i]`` is registered as a single component
+    ``sheet_{i+1}`` (one component sharing types across all its layers -- for
+    SW materials the short many-body cutoff prevents spurious interlayer terms,
+    so per-layer type expansion is neither needed nor wanted). Every component
+    gets its own many-body ``add_self_interaction`` inside a ``pair_style
+    hybrid``, and every distinct material pair gets a UFF-mixed
+    ``add_cross_interaction`` (``lj/cut`` for each A-B element pair). The
+    settings are written to ``<workdir>/lammps/system.in.settings`` and the
+    potential files are staged under ``<workdir>/provenance/potentials``.
+
+    Args:
+        sheets: Per-material sheet configs (>= 2 materials).
+        settings: Global simulation settings.
+        workdir: Directory to write ``system.in.settings`` and the staged
+            provenance potentials into (created if missing).
+
+    Returns:
+        :class:`HeteroPotentials` exposing the configured manager, the written
+        settings path, and the per-material type blocks / offsets (derived from
+        the PM type registry, not hand-computed).
+
+    Raises:
+        ValueError: If fewer than two materials are supplied (a heterostructure
+            needs at least two).
+    """
+    if len(sheets) < 2:
+        raise ValueError(
+            f"register_hetero_potentials needs >= 2 materials to build a "
+            f"heterostructure interface, got {len(sheets)}."
+        )
+
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    # Mirror the AFM / sheet-on-sheet potential path exactly: stage the real
+    # potential files under the run dir's provenance folder and reference them
+    # by a run-dir-relative prefix in the pair_coeff lines.
+    pm = PotentialManager(
+        settings,
+        potentials_dir=workdir / "provenance" / "potentials",
+        potentials_prefix=str(Path("provenance") / "potentials"),
+    )
+
+    # 1. One component per material -> disjoint, contiguous global type blocks
+    #    (the PM's TypeRegistry assigns the IDs; we never hand-roll them).
+    component_names: List[str] = []
+    for i, sheet in enumerate(sheets):
+        name = f"sheet_{i + 1}"
+        pm.register_component(name, sheet, n_layers=1)
+        component_names.append(name)
+
+    # 2. Each material's own many-body potential (hybrid entry per component).
+    for name in component_names:
+        pm.add_self_interaction(name)
+
+    # 3. UFF-mixed lj/cut cross-terms for every material pair at the interface.
+    for i in range(len(component_names)):
+        for j in range(i + 1, len(component_names)):
+            pm.add_cross_interaction(component_names[i], component_names[j])
+
+    settings_path = workdir / "lammps" / "system.in.settings"
+    pm.write_file(settings_path)
+
+    # 4. Read the per-material type blocks back from the registry (source of
+    #    truth); derive read_data offsets from where each block starts.
+    type_ids = [pm.types.ids_by_component(name) for name in component_names]
+    type_offsets = [ids[0] - 1 for ids in type_ids]
+
+    return HeteroPotentials(
+        pm=pm,
+        settings_path=settings_path,
+        component_names=component_names,
+        type_ids=type_ids,
+        type_offsets=type_offsets,
+    )
 
 
 def _embed_3x3(matrix_2x2: np.ndarray) -> np.ndarray:

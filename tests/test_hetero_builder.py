@@ -14,14 +14,16 @@ Covers:
   re-canonicalized frame, would produce non-coinciding boxes / spurious strain.
 * Fail-loud behavior when no low-strain coincidence exists.
 """
+import re
+
 import numpy as np
 import pytest
 from ase import Atoms
 from ase.io import read, write
 
 from src.builders import components
-from src.builders.hetero import build_matched_supercells
-from src.core.config import SheetConfig
+from src.builders.hetero import build_matched_supercells, register_hetero_potentials
+from src.core.config import SheetConfig, load_settings
 from src.core.lattice_matching import find_coincidence_lattice
 
 MOS2_CIF = "examples/materials/h-MoS2.cif"
@@ -37,15 +39,16 @@ MOS2_POT = "examples/potentials/sw/MoS2_wen.sw"
 WS2_POT = "examples/potentials/sw/sw_lammps/t-WS2.sw"
 
 
-def _build_small_monolayer(mat: str, cif_path: str, pot_path: str):
-    """Build a minimal (single orthogonalized unit cell) monolayer.
+def _sheet_config(mat: str, cif_path: str, pot_path: str) -> SheetConfig:
+    """Build a minimal single-monolayer :class:`SheetConfig` for a material.
 
     x/y = 4.0 Å is smaller than one duplicated unit cell (~6.4 Å) for both
     materials, so build_monolayer's target-size rounding keeps dup=(1, 1):
-    the smallest structure it can produce, i.e. exactly its orthogonalized
-    unit cell with no extra tiling.
+    the smallest structure it can produce. For potential registration the
+    in-plane size is irrelevant (only cif_path/pot_path/pot_type are read),
+    but keeping a single, shared constructor mirrors the real build path.
     """
-    config = SheetConfig(
+    return SheetConfig(
         mat=mat,
         pot_type="sw",
         pot_path=pot_path,
@@ -54,8 +57,71 @@ def _build_small_monolayer(mat: str, cif_path: str, pot_path: str):
         y=4.0,
         layers=[1],
     )
+
+
+def _build_small_monolayer(mat: str, cif_path: str, pot_path: str):
+    """Build a minimal (single orthogonalized unit cell) monolayer."""
+    config = _sheet_config(mat, cif_path, pot_path)
     path, _dims, _pot_counts, _total_types, _supercell_dims = components.build_monolayer(config)
     return path
+
+
+def test_hetero_type_blocks_disjoint_and_potentials_complete(tmp_path):
+    """Each stacked material becomes its own PotentialManager component with a
+    disjoint, contiguous atom-type block, its own many-body ``sw`` in a
+    ``pair_style hybrid``, and UFF ``lj/cut`` cross-terms for every A-B element
+    pair -- all emitted into ``system.in.settings``.
+
+    Guards the old branch's half-done type mapping: the two materials' global
+    type-ID sets must be disjoint (no overlap) AND together contiguous/complete
+    (cover every registered type, 1..N, no gaps). Type IDs are read from the PM
+    type registry, never parsed from text.
+    """
+    sheets = [
+        _sheet_config("h-MoS2", MOS2_CIF, MOS2_POT),
+        _sheet_config("h-WS2", WS2_CIF, WS2_POT),
+    ]
+    settings = load_settings()
+
+    hp = register_hetero_potentials(sheets, settings, workdir=tmp_path)
+
+    text = open(hp.settings_path).read()
+
+    # --- hybrid pair_style with one many-body (sw) entry per material ---
+    assert "pair_style hybrid" in text
+    style_line = next(l for l in text.splitlines() if l.startswith("pair_style hybrid"))
+    assert style_line.split().count("sw") == len(sheets)
+
+    # --- UFF lj/cut cross-terms for every A-B element pair ---
+    assert "lj/cut" in text
+    cross_lines = [
+        l for l in text.splitlines()
+        if "lj/cut" in l and l.strip().startswith("pair_coeff")
+    ]
+    els_a = hp.pm.types.elements_in_component("sheet_1")
+    els_b = hp.pm.types.elements_in_component("sheet_2")
+    expected_pairs = {frozenset((x, y)) for x in els_a for y in els_b}
+    got_pairs = set()
+    for line in cross_lines:
+        m = re.search(r"#\s*(\w+)\(sheet_1\)-(\w+)\(sheet_2\)", line)
+        assert m is not None, f"unexpected cross-interaction line: {line!r}"
+        got_pairs.add(frozenset((m.group(1), m.group(2))))
+    assert got_pairs == expected_pairs  # e.g. {Mo-W, Mo-S, S-W, S-S}
+
+    # --- Type registry: disjoint AND contiguous/complete (from the PM, not text) ---
+    assert len(hp.type_ids) == len(sheets)
+    id_sets = [set(ids) for ids in hp.type_ids]
+    a_ids, b_ids = id_sets
+    assert a_ids and b_ids
+    assert a_ids.isdisjoint(b_ids)                      # no overlap
+    union = a_ids | b_ids
+    assert union == set(range(1, max(union) + 1))       # contiguous from 1, no gaps
+    assert len(union) == len(hp.pm.types)               # covers every registered type
+
+    # Cross-check against the live registry and the read_data offsets.
+    for name, ids in zip(hp.component_names, hp.type_ids):
+        assert hp.pm.types.ids_by_component(name) == ids
+    assert hp.type_offsets == [ids[0] - 1 for ids in hp.type_ids]
 
 
 def _write_synthetic_monolayer(path, cell_2x2, charges=None):
