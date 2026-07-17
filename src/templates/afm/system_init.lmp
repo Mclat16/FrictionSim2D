@@ -63,7 +63,7 @@ thermo          {{ thermo }}
 group           fixset union sub_fix {{ tip_fix_group }}
 group           system subtract all fixset
 
-velocity        system create {{ temp }} {{ range(1, 999999) | random }}
+velocity        system create {{ temp }} {{ velocity_seed if velocity_seed is not none else (range(1, 999999) | random) }}
 velocity        2D zero angular
 
 {% if thermostat_type == 'langevin' %}

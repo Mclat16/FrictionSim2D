@@ -21,10 +21,15 @@ logger = logging.getLogger(__name__)
 
 class AFMSimulation(SimulationBase):
     """Builder for AFM simulations (Tip + Sheet + Substrate).
-    
+
     Handles layer sweeps internally - when config.sheet.layers is a list,
     builds common components once and iterates over layer counts.
     """
+
+    #: Run-phase (post-indentation) LAMMPS template. Subclasses swap this to
+    #: reuse the identical build + system.in indentation with a different
+    #: production run (e.g. the indent hold+retract replaces the slide).
+    SLIDE_TEMPLATE: str = "afm/slide.lmp"
 
     def __init__(self, config: AFMSimulationConfig, output_dir: str,
                     config_path: Optional[str] = None):
@@ -102,6 +107,15 @@ class AFMSimulation(SimulationBase):
     def _get_hpc_job_name(self) -> str:
         """Get AFM-specific job name."""
         return f"afm_{self.config.sheet.mat}"
+
+    def _velocity_seed(self, n_layers: int) -> Optional[int]:
+        """Explicit ``velocity create`` seed for system.in, or None for random.
+
+        AFM draws a fresh random seed each render (None). The indent overrides this
+        to inject a recorded, reproducible per-(material, layer) seed so the fresh
+        contact trajectory is captured in the manifest.
+        """
+        return None
 
     def _init_provenance(self) -> None:
         """Initialize provenance folder and collect input files."""
@@ -533,6 +547,7 @@ class AFMSimulation(SimulationBase):
             'finite_sheet_edge_mode': self.config.settings.geometry.finite_sheet_afm_edge_mode,
             'finite_sheet_edge_width': self.config.settings.geometry.finite_sheet_edge_width,
             'finite_sheet_edge_spring_k': self.config.settings.geometry.finite_sheet_edge_spring_k,
+            'velocity_seed': self._velocity_seed(n_layers),
         }
         context.update(flake_ctx)
         return context
@@ -577,11 +592,11 @@ class AFMSimulation(SimulationBase):
             for load in forces:
                 slide_context = dict(context)
                 slide_context['forces'] = load
-                script = self.render_template("afm/slide.lmp", slide_context)
+                script = self.render_template(self.SLIDE_TEMPLATE, slide_context)
                 script_name = f"slide_f{format_numeric_token(float(load))}N.in"
                 self.write_file(f"lammps/{script_name}", script, output_root)
             logger.info("Split slide phase into %d per-load scripts.", len(forces))
             return
 
-        slide_script = self.render_template("afm/slide.lmp", context)
+        slide_script = self.render_template(self.SLIDE_TEMPLATE, context)
         self.write_file("lammps/slide.in", slide_script, output_root)

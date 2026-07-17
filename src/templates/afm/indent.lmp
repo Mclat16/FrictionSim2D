@@ -1,0 +1,191 @@
+# LAMMPS input script for the AFM indentation "indent" run: hold + pull-off retract.
+#
+# One vertical-contact run per load, merging the two contact measurements that the
+# lateral PES scan cannot see (the sliding phase, afm/slide.lmp, is NEVER invoked):
+#
+#   PHASE 1 -- HOLD (finite-T damped MD).  Read the loaded contact written by the
+#     system.in aveforce ramp (load_<f>N.data), re-apply the target normal load via
+#     aveforce and hold the rigid, laterally-fixed tip for a short DAMPED hold,
+#     recording only the out-of-plane channels. The thermally-averaged penetration
+#     depth (tip_z - sheet_com_z) is the vertical-compliance descriptor. The output
+#     cadence + 10-column layout match afm/slide.lmp, so postprocessing/read_data.py
+#     parses the hold file unchanged. No lateral motion.
+#
+#   PHASE 2 -- RETRACT (T=0 minimization).  Tear down every dynamics fix from the
+#     hold, freeze the rigid tip, and RETRACT it quasi-statically in small z-steps
+#     -- minimizing the sheet + substrate at each step -- from the held contact,
+#     through zero load, past the pull-off instability, to full detachment. The
+#     force-distance curve (z_tip, fz_tip, pe per step -> CSV) yields the pull-off
+#     force, work of adhesion and contact stiffness. No sliding.
+#
+# See src/builders/indent.py, src/postprocessing/indent.py and POKE_SIM_RECIPE.md.
+
+variable        a equal {{ scan_angle_config if scan_angle_config is not none else 0 }}
+{% if scan_speed_config is iterable and scan_speed_config is not string %}
+variable        speed equal {{ scan_speed_config[0] }}
+{% else %}
+variable        speed equal {{ scan_speed_config }}
+{% endif %}
+
+{% if forces is iterable and forces is not string %}
+variable        find index {{ forces | join(' ') }}
+label           force_loop
+{% else %}
+variable        find equal {{ forces }}
+{% endif %}
+
+clear
+units           metal
+atom_style      {{ atom_style }}
+boundary        p p p
+
+neighbor        {{ neighbor_list }} bin
+{{ neigh_modify_command }}
+
+timestep        {{ timestep }}
+thermo          {{ thermo }}
+comm_style      tiled
+
+# The loaded contact state written by the system.in aveforce ramp (fresh seed).
+read_data       {{ output_dir }}/load_$(v_find)N.data
+include         {{ potential_file }}
+
+group           2D type {{ sheet_types }}
+velocity        2D zero angular
+
+{% if finite_sheet_enabled and finite_sheet_edge_mode == 'spring' %}
+group           sheet_edge intersect 2D 2D_edge
+fix             fs_edge sheet_edge spring/self {{ finite_sheet_edge_spring_k }} xy
+{% endif %}
+
+{% if dump_enabled %}
+dump            sys all atom {{ dump_freq }} {{ dump_file_pattern }}
+{% endif %}
+
+balance         1.0 rcb
+
+# =====================================================================================
+# PHASE 1 -- finite-T damped hold at the target load (penetration).  No sliding.
+# =====================================================================================
+fix             sub_fix sub_fix setforce 0.0 0.0 0.0
+# Rigid tip, free only in z (laterally fixed): a pure vertical hold, never a slide.
+fix             tip_f {{ tip_fix_group }} rigid/nve single force * off off on torque * off off off
+
+{% if thermostat_type == 'langevin' %}
+compute         temp_tip tip_thermo temp/partial 0 1 0
+fix             lang_tip tip_thermo langevin {{ temp }} {{ temp }} $(100.0*dt) {{ range(1, 999999) | random }} zero yes
+fix_modify      lang_tip temp temp_tip
+
+compute         temp_sub sub_thermo temp/partial 0 1 0
+fix             lang_sub sub_thermo langevin {{ temp }} {{ temp }} $(100.0*dt) {{ range(1, 999999) | random }} zero yes
+fix_modify      lang_sub temp temp_sub
+
+group           nve_apply subtract all sub_fix {{ tip_fix_group }}
+fix             nve_all nve_apply nve
+{% endif %}
+
+# Out-of-plane channels: sheet-COM z (comz) and tip-COM z (tipz). Penetration
+# depth = tipz - comz; both use the exact groups the sliding campaign records so
+# the indent penetration is directly comparable to the campaign contact features.
+compute         COM_top {{ layer_group }} com
+variable        comx equal c_COM_top[1]
+variable        comy equal c_COM_top[2]
+variable        comz equal c_COM_top[3]
+
+compute         COM_tip {{ tip_fix_group }} com
+variable        comx_tip equal c_COM_tip[1]
+variable        comy_tip equal c_COM_tip[2]
+variable        comz_tip equal c_COM_tip[3]
+
+run             0
+
+# Re-apply the target normal load (nN -> eV/A per atom) and hold it.
+variable        Ftotal equal -v_find/{{ ev_a_to_nn }}
+variable        n equal v_Ftotal/count({{ tip_fix_group }})
+fix             forcetip {{ tip_fix_group }} aveforce 0.0 0.0 $n
+
+# nf = felt normal force; aveforce stores the pre-constraint group force in
+# f_forcetip[1..3], so [3] is the normal channel and [1]/[2] the lateral reaction.
+variable        fz_tip equal f_forcetip[3]*{{ ev_a_to_nn }}
+variable        fx_react equal f_forcetip[1]*{{ ev_a_to_nn }}
+variable        fy_react equal f_forcetip[2]*{{ ev_a_to_nn }}
+
+# Same order/cadence as afm/slide.lmp fix fc_ave -> read_data._AFM_FILE_COLUMNS:
+# time nf lfx lfy comx comy comz tipx tipy tipz  (~10 samples over the hold).
+fix             fc_ave all ave/time 1 1000 {{ results_freq }} v_fz_tip v_fx_react v_fy_react v_comx v_comy v_comz v_comx_tip v_comy_tip v_comz_tip file {{ results_file_pattern }}
+
+{% if damp_ev is not none %}
+fix             damp {{ tip_fix_group }} viscous {{ damp_ev }}
+{% else %}
+# Viscous damping auto-set to zeta = {{ damping_ratio }} of critical so the tip
+# settles quasi-statically within the hold (leave [tip] dspring blank to enable).
+fix             damp {{ tip_fix_group }} viscous $({{ damping_ratio }}*2.0*sqrt({{ spring_ev }}*mass({{ tip_fix_group }}))/(count({{ tip_fix_group }})*sqrt(9648.5009)))
+{% endif %}
+
+# --- quasi-static damped hold at the target load (no sliding) ---------------------
+run             {{ hold_steps }}
+
+# =====================================================================================
+# PHASE 2 -- displacement-controlled T=0 retract from the held contact (pull-off).
+# =====================================================================================
+# Remove every dynamics fix from the hold so the minimization sees only conservative
+# forces (langevin random forces, the aveforce load and the viscous drag would each
+# corrupt the sub-nN pull-off curve). Then release the rigid-body tip so the whole
+# tip (tip_all) can be frozen and displaced as a unit.
+unfix           fc_ave
+unfix           damp
+unfix           forcetip
+{% if thermostat_type == 'langevin' %}
+unfix           nve_all
+unfix           lang_tip
+unfix           lang_sub
+uncompute       temp_tip
+uncompute       temp_sub
+{% endif %}
+unfix           tip_f
+uncompute       COM_tip
+
+min_style       {{ min_style }}
+
+# Substrate base stays held (sub_fix, carried over from the hold); the rigid tip
+# (all tip atoms, group tip_all) is frozen and moved only by displace_atoms -- a
+# displacement-controlled quasi-static retract, never a slide. setforce stores the
+# pre-zero total group force in f_tip_hold[1..3]: [3] is the normal force the surface
+# exerts on the tip, [1]/[2] the lateral reaction.
+fix             tip_hold tip_all setforce 0.0 0.0 0.0
+
+# Relax the held +load contact to its quasi-static configuration before the first
+# sample so the retract curve starts from a converged reference state.
+{{ retract_minimize }}
+
+compute         COM_tip_r tip_all com
+variable        ztip equal c_COM_tip_r[3]
+variable        fztip equal f_tip_hold[3]*{{ ev_a_to_nn }}
+variable        fxtip equal f_tip_hold[1]*{{ ev_a_to_nn }}
+variable        fytip equal f_tip_hold[2]*{{ ev_a_to_nn }}
+variable        pe_now equal pe
+
+run             0
+
+# CSV: step index, tip COM z (Angstrom), fz/fx/fy on the tip (nN), total PE (eV).
+print           "step,z_tip,fz_tip,fx_tip,fy_tip,pe" file {{ results_csv }} screen no
+print           "0,$(v_ztip),$(v_fztip),$(v_fxtip),$(v_fytip),$(v_pe_now)" append {{ results_csv }} screen no
+
+# --- quasi-static displacement-controlled retract (no sliding) --------------------
+# Move the tip up by z_step and relax the sheet + substrate at each step; the felt
+# fz_tip runs from repulsive (+) through zero, dips into the adhesive well (-), and
+# returns toward zero at full detachment -- the pull-off curve.
+variable        zstep equal {{ z_step }}
+variable        k loop {{ n_steps }}
+label           retract_loop
+displace_atoms  tip_all move 0.0 0.0 ${zstep} units box
+{{ retract_minimize }}
+print           "$(v_k),$(v_ztip),$(v_fztip),$(v_fxtip),$(v_fytip),$(v_pe_now)" append {{ results_csv }} screen no
+next            k
+jump            SELF retract_loop
+
+{% if forces is iterable and forces is not string %}
+next            find
+clear
+jump            SELF force_loop
+{% endif %}

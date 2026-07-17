@@ -118,6 +118,13 @@ def grid_descriptors(df: pd.DataFrame, kind: str) -> Dict[str, float]:
         flat = np.hypot(df["fx"].to_numpy(float), df["fy"].to_numpy(float))
         out["pes_fmax"] = float(np.nanmax(flat))
         out["pes_flat_rms"] = float(np.sqrt(np.nanmean(flat ** 2)))
+    if kind == "tip" and "fz" in df.columns:
+        # The normal force the tip carries at the fixed contact gap — the actual
+        # load this scan corresponds to (not a setpoint). Mean over the grid is the
+        # representative load; the spread flags how load-varying the contact is.
+        fz = df["fz"].to_numpy(float)
+        out["pes_load_mean"] = float(np.nanmean(fz))
+        out["pes_load_std"] = float(np.nanstd(fz))
     return out
 
 

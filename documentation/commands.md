@@ -55,6 +55,24 @@ tip + sheet + substrate stack to a low load exactly as the sliding sim, then
 grid-scans the rigid tip laterally, recording energy and the lateral force on the
 tip. Same options as `run afm`. See [pes_scan.md](pes_scan.md).
 
+### run indent
+
+```bash
+FrictionSim2D run indent CONFIG_FILE [OPTIONS]
+```
+
+Generate an **AFM indentation ("indent")** simulation — the standard AFM build +
+indentation ramp (`system.in`) to each load in `[general] force`, then per load a
+short **damped hold** (finite-T) followed by a displacement-controlled
+**quasi-static retract** of the rigid tip to full detachment; the sliding phase is
+never invoked. Records both the out-of-plane **penetration** channels (vertical
+compliance) and the force–distance **retract** curve (pull-off force, work of
+adhesion, contact stiffness), with a fresh, recorded velocity seed per
+`(material, layer)`. Adds an `[indent]` section (`hold_steps`, `z_step`,
+`n_steps`, `seed`); loads come from `[general] force`. Same options as `run afm`.
+Subsumes the former separate `run poke` (hold-only) and `run adhesion`
+(retract-only) commands. See [indent.md](indent.md).
+
 ## settings
 
 ### settings show
@@ -307,6 +325,30 @@ Options:
 Scans `RUN_ROOT` for `pes_sheet/` and `pes_tip/` results and writes one row per
 material (merge key `material`), ready for the ML feature pipeline. See
 [pes_scan.md](pes_scan.md).
+
+### postprocess indent
+
+Reduce an indent run to penetration JSON + adhesion features + tidied curves:
+
+```bash
+FrictionSim2D postprocess indent RUN_ROOT [OPTIONS]
+```
+
+Options:
+
+- `-o, --out-dir PATH` (default: `outputs/poke_sims`) — destination for the
+  per-load penetration JSON, the tidied `indent/<material>_l<layer>.csv` retract
+  curves and `indent_manifest.csv`
+- `-d, --data-dir PATH` (default: same as `--out-dir`) — destination for
+  `indent_features.csv`
+
+Delivers both descriptor sets from the one hold+retract run: the campaign reader
+writes one `output_indent_f<load>_s<seed>.json` per load (penetration, nested
+campaign schema); each retract curve is reduced to `pulloff_force`,
+`work_of_adhesion` and `contact_stiffness` (`indent_features.csv`, keyed
+`material, layer, load`) with the tidied per-condition curves copied alongside;
+and `indent_manifest.csv` (`material, layer, load, seed, hold_steps, z_step,
+n_steps, wall_time`) records the provenance. See [indent.md](indent.md).
 
 ## db
 

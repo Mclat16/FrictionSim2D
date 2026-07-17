@@ -10,3 +10,4 @@ settings.yaml
 .vscode
 .pytest_cache
 frictionsim2d-file-audit.md
+docs/

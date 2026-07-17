@@ -360,3 +360,54 @@ def test_lattice_match_section_is_parsed(tmp_path):
         LatticeMatchConfig(strain_tol=2.0)   # > 1.0
     with pytest.raises(Exception):
         LatticeMatchConfig(max_supercell=0)  # < 1
+
+
+def test_lattice_match_area_tol_is_bounded():
+    """area_tol must be in [0, 1]; out-of-range values are rejected."""
+    from src.core.config import LatticeMatchConfig
+    with pytest.raises(ValidationError):
+        LatticeMatchConfig(area_tol=2.0)
+
+
+def test_two_material_sections_fold_into_sheets_list(tmp_path, monkeypatch):
+    """[2D-1]/[2D-2] sections fold into cfg.sheets in numeric order."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings()
+    raw = {
+        "general": {"temp": 300, "scan_speed": 1, "hetero_stacking": "alternating"},
+        "2D-1": {"mat": "MoS2", "cif_path": str(dummy_cif), "pot_path": str(dummy_pot),
+                 "pot_type": "sw", "x": 30, "y": 30, "layers": [1], "stack_type": "AB"},
+        "2D-2": {"mat": "WS2", "cif_path": str(dummy_cif), "pot_path": str(dummy_pot),
+                 "pot_type": "sw", "x": 30, "y": 30, "layers": [1], "stack_type": "AB"},
+    }
+    cfg = SheetOnSheetSimulationConfig(**raw, settings=settings)
+    assert [s.mat for s in cfg.sheets] == ["MoS2", "WS2"]
+    assert cfg.general.hetero_stacking == "alternating"
+    # Backward-compatible single-sheet accessor still resolves to the first material.
+    assert cfg.sheet.mat == "MoS2"
+
+
+def test_single_2d_section_still_builds_one_element_sheets_list(tmp_path, monkeypatch):
+    """A lone [2D] section (no [2D-N]) still builds and yields len(sheets) == 1."""
+    dummy_pot = tmp_path / "dummy.sw"
+    dummy_cif = tmp_path / "dummy.cif"
+    dummy_pot.write_text("# dummy potential\n", encoding="utf-8")
+    dummy_cif.write_text("# dummy cif\n", encoding="utf-8")
+    monkeypatch.setattr("src.core.config.get_potential_path", lambda _v: dummy_pot)
+    monkeypatch.setattr("src.core.config.get_material_path", lambda _v: dummy_cif)
+
+    settings = load_settings()
+    cfg = SheetOnSheetSimulationConfig(
+        general=VALID_GENERAL,
+        **{'2D': VALID_SHEET},
+        settings=settings,
+    )
+    assert len(cfg.sheets) == 1
+    assert cfg.sheets[0].mat == "MoS2"
+    assert cfg.sheet.mat == "MoS2"

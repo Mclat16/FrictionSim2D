@@ -382,6 +382,14 @@ class GeneralConfig(BaseModel):
         default=False,
         description="Enable finite-sheet AFM geometry for this run.",
     )
+    hetero_stacking: Literal['grouped', 'alternating'] = Field(
+        default='grouped',
+        description=(
+            "Layer ordering for multi-material heterostructure stacks. 'grouped' "
+            "stacks all layers of one material before the next; 'alternating' "
+            "interleaves layers across materials."
+        ),
+    )
 
 
 class PESConfig(BaseModel):
@@ -421,35 +429,120 @@ class PESConfig(BaseModel):
         default=True,
         description="Sheet scan: relax top-layer z at each grid point (relaxed PES).",
     )
-    tip_load: float = Field(
-        default=30.0,
-        gt=0,
+    tip_load: Optional[float] = Field(
+        default=5.0,
         description=(
-            "Tip scan only — the single normal load (nN) at which the tip is pressed "
-            "into contact before scanning. The descriptor must be built at a STABLE "
-            "contact load: at ~2 nN the tip barely holds contact (the real sims are "
-            "near-random there), so the deployable scan uses a firm load in the "
-            "5-50 nN friction regime (default 30 nN, chosen data-drivenly as the "
-            "cof_std plateau / densest-sampled real load)."
+            "Tip scan only — the target grid-mean normal load (nN) for a constant-load "
+            "campaign. The scan itself is constant-height (the tip is held at a gap), "
+            "so the load can only be known from a full scan; the campaign runner "
+            "therefore calibrates each material's fz(gap) curve and picks the gap whose "
+            "grid-mean load lands on this target, then runs the scan there. The gap→load "
+            "calibration (see gap_load_calibration/) showed the bilayer reaches ~2-12 nN "
+            "inside its stable gap window; ~5 nN is the clean default (strong, resolvable "
+            "corrugation for all but the most compliant sheets, which cap at their max "
+            "achievable load). Null/0 → the fixed contact gap (an adhesion descriptor)."
         ),
     )
     tip_load_sweep: Optional[List[float]] = Field(
         default=None,
         description=(
             "Tip scan only — optional diagnostic list of loads (nN) to scan at, each "
-            "emitting its own script/grid (e.g. [2, 20, 30, 50]). Produces the "
-            "'descriptor predictive value climbs as it leaves the 2 nN pathology' "
-            "figure; not the deployable descriptor (that is the single tip_load)."
+            "emitting its own script/grid (e.g. [2, 5, 10]). Produces the 'descriptor "
+            "predictive value climbs as it leaves the 2 nN pathology' figure; not the "
+            "deployable descriptor (that is the single tip_load). NB currently a load "
+            "series is run as separate campaigns (one tip_load each); per-sim "
+            "multi-grid emission is not yet wired."
+        ),
+    )
+    scan_cells: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Tip scan only — number M of surface unit cells (M×M) the lateral scan "
+            "spans, at grid_n points *per cell* (so the emitted grid is M·grid_n square "
+            "over M·a × M·b). M=1 (default) is the standard single-cell scan and changes "
+            "nothing. M>1 is a representativeness diagnostic: on a disordered/amorphous "
+            "backing a single cell is one random patch of a non-periodic PES, and only a "
+            "multi-cell scan can measure the cell-to-cell descriptor spread (the error "
+            "bar) and separate real periodic corrugation from substrate noise. Needs a "
+            "sheet footprint large enough that the tip clears its own periodic image over "
+            "the M-cell travel (the builder warns if not)."
+        ),
+    )
+
+
+class IndentConfig(BaseModel):
+    """AFM indentation ("indent") parameters — damped hold + pull-off retract.
+
+    An indent run does the standard AFM build + indentation ramp (``system.in``)
+    to each normal load in ``[general] force``, then (see :mod:`src.builders.indent`,
+    ``POKE_SIM_RECIPE.md``) runs one hold+retract per load without ever sliding:
+
+        1. holds the (rigid, laterally-fixed) tip at the target load for a short
+           *damped* finite-T hold, recording the out-of-plane channels — the
+           thermally-averaged penetration depth (``tip_z − sheet_com_z``) is the
+           vertical-compliance descriptor the lateral PES scan cannot see; then
+        2. tears down the MD fixes and **retracts the rigid tip quasi-statically**
+           (T=0 minimization) in small z-steps — through zero load, past the
+           pull-off instability, to full detachment — giving the force–distance
+           curve for the **pull-off force**, **work of adhesion** and **contact
+           stiffness** (the adhesion descriptors no sliding/hold data holds).
+
+    The loads come from ``[general] force`` (``{10, 30}`` nN are the deployable
+    2-point anchor; ``{5, 20, 50}`` add the 9-point stiffness ceiling and
+    load-resolved pull-off), the layers from ``[2D] layers`` and the angle is 0 —
+    matching the campaign labels. This one type subsumes the former separate poke
+    (hold-only) and adhesion (retract-only) simulations.
+
+    Attributes:
+        hold_steps: Length of the damped hold at the target load, in steps
+            (10 000 steps = 10 ps at the 1 fs campaign timestep). At the 1 ps
+            (every-1000-step) campaign cadence this yields ~10 samples per
+            condition — penetration is thermally stable over the window.
+        z_step: Retract increment per step, in Å (recipe: 0.1–0.2 Å for a
+            quasi-static curve that resolves the pull-off instability).
+        n_steps: Number of retract steps. ``n_steps × z_step`` is the total
+            retract distance — it must comfortably exceed the adhesive tail so the
+            curve reaches full detachment (default 100 × 0.2 Å = 20 Å).
+        seed: Base velocity seed for the campaign. Each ``(material, layer)``
+            derives its own fresh, reproducible velocity-create seed from this base
+            (recorded in the manifest). **A fresh seed per run is mandatory** —
+            reusing a campaign seed reproduces the campaign contact trajectory and
+            re-imports the same-run optimism the verification excludes. When
+            omitted a fresh base seed is drawn once at build time.
+    """
+    hold_steps: int = Field(
+        default=10000,
+        ge=1000,
+        description="Damped-hold length in steps at the target load (10 000 = 10 ps).",
+    )
+    z_step: float = Field(
+        default=0.2,
+        gt=0.0,
+        description="Retract increment per step in Å (recipe: 0.1–0.2 Å).",
+    )
+    n_steps: int = Field(
+        default=100,
+        ge=1,
+        description="Number of retract steps (n_steps × z_step = total retract distance).",
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Base velocity seed; per-(material, layer) fresh seeds are derived "
+            "from it and recorded in the manifest. Omit to draw a fresh base "
+            "seed at build time. Never reuse a campaign seed."
         ),
     )
 
 
 class LatticeMatchConfig(BaseModel):
     """Lattice-matching parameters for heterostructure interfaces."""
-    method: str = 'zur_mcgill'
+    method: Literal['zur_mcgill'] = 'zur_mcgill'
     strain_tol: float = Field(default=0.02, ge=0.0, le=1.0)
     max_supercell: int = Field(default=10, ge=1)
-    area_tol: float = 0.10
+    area_tol: float = Field(default=0.10, ge=0.0, le=1.0)
 
 
 class AFMSimulationConfig(BaseModel):
@@ -460,6 +553,7 @@ class AFMSimulationConfig(BaseModel):
     sheet: SheetConfig = Field(..., alias='2D')
     flake: Optional[FlakeConfig] = Field(default=None, alias='flake')
     pes: Optional[PESConfig] = Field(default=None, alias='pes')
+    indent: Optional[IndentConfig] = Field(default=None, alias='indent')
     lj_override: Dict[str, Any] = Field(default_factory=dict, alias='lj_override')
     settings: GlobalSettings
 
@@ -516,12 +610,53 @@ class AFMSimulationConfig(BaseModel):
 
 class SheetOnSheetSimulationConfig(BaseModel):
     """Master configuration object for a Sheet-on-Sheet simulation run."""
-    lattice_match: Optional[LatticeMatchConfig] = Field(default=None, alias='lattice_match')
     general: GeneralConfig
     sheet: SheetConfig = Field(..., alias='2D')
+    sheets: List[SheetConfig] = Field(
+        default_factory=list,
+        description=(
+            "Per-material sheet stack, folded from [2D-1], [2D-2], ... sections "
+            "(or a single-element list wrapping [2D] when only one material is "
+            "given). Populated by _fold_sheet_sections before validation."
+        ),
+    )
     pes: Optional[PESConfig] = Field(default=None, alias='pes')
+    lattice_match: Optional[LatticeMatchConfig] = Field(default=None, alias='lattice_match')
     lj_override: Dict[str, Any] = Field(default_factory=dict, alias='lj_override')
     settings: GlobalSettings
+
+    @model_validator(mode='before')
+    @classmethod
+    def _fold_sheet_sections(cls, data: Any) -> Any:
+        """Fold [2D-1], [2D-2], ... sections into ``sheets``.
+
+        Numbered ``2D-N`` sections are collected in numeric order into the
+        ``sheets`` list. When only a single ``[2D]`` (alias) section is
+        present, it is wrapped as a one-element ``sheets`` list, preserving
+        the homogeneous single-material path. The ``2D``/``sheet`` field
+        stays required for backward compatibility: when only numbered
+        sections are given, the first is also mirrored onto ``2D`` so
+        existing single-sheet code paths keep working unchanged.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        folded = dict(data)
+        two_d_keys = sorted(
+            (k for k in folded if isinstance(k, str) and k.startswith('2D-')),
+            key=lambda key: (
+                int(key.split('-', maxsplit=1)[1])
+                if key.split('-', maxsplit=1)[1].isdigit() else 10**9
+            ),
+        )
+
+        if two_d_keys:
+            folded['sheets'] = [folded[k] for k in two_d_keys]
+            folded.setdefault('2D', folded[two_d_keys[0]])
+        elif '2D' in folded:
+            folded['sheets'] = [folded['2D']]
+
+        return folded
 
 # --- Helper Functions ---
 

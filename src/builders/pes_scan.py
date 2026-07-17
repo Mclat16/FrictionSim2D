@@ -44,12 +44,18 @@ DEFAULT_GRID_N = 12
 #: giving clean per-point energies and lateral forces.
 PES_MINIMIZE_COMMAND = "minimize 0.0 1.0e-6 10000 100000"
 
-#: Fixed contact gap (Å) between the lowest tip atom and the highest sheet atom for
-#: the tip scan. A firm static contact in the tip/sheet interaction well: a true
-#: repulsive-load contact is not well-defined here (a compliant monolayer conforms
-#: to a pressed tip, so the normal force stays attractive), and the forced static
-#: contact is essentially load-independent, so a fixed firm gap is the clean choice.
+#: Default contact gap (Å) between the lowest tip atom and the highest sheet atom for
+#: the tip scan. The calibration study showed this fixed gap sits in the *attractive*
+#: well (fz ≈ −2 to −6 nN) for every material, so on its own it is an adhesion, not a
+#: load, descriptor. A constant-load campaign (see gap_load_calibration/) overrides
+#: it per material with the gap whose grid-mean load hits ``pes.tip_load``.
 PES_TIP_CONTACT_GAP = 3.5
+
+#: Gap search bracket (Å) the constant-load campaign runner uses to calibrate the
+#: per-material gap. The lower bound is the firmest gap that stays physical for the
+#: bilayer (gaps < 2.5 Å drive some grid points into the atom-crash regime); the
+#: upper bound is safely in the attractive tail. Loads of ~2–12 nN sit inside it.
+PES_LOAD_GAP_BRACKET = (2.5, 3.75)
 
 #: The static PES bilayer needs exactly two layers: a frozen bottom and a rigid,
 #: laterally-scanned top.
@@ -207,26 +213,72 @@ class PESTipSimulation(AFMSimulation):
         pes = getattr(self.config, 'pes', None)
         return bool(pes.z_relax) if pes is not None else True
 
+    def _scan_cells(self) -> int:
+        pes = getattr(self.config, 'pes', None)
+        return int(pes.scan_cells) if pes is not None else 1
+
+    def _warn_if_footprint_too_small(self, m: int, period_x: float, period_y: float) -> None:
+        """Warn if the tip would overlap its own periodic image over an M-cell scan.
+
+        The rigid tip (diameter 2·r) is rastered by up to M·period from its start; for
+        its far edge not to reach the tip's periodic image the box must exceed the tip
+        diameter plus the scan travel plus one interaction cutoff. On a too-small box the
+        multi-cell PES is contaminated by tip–image forces, not the surface corrugation.
+        """
+        if m <= 1:
+            return
+        try:
+            box_x = float(self.box_dims['xhi'] - self.box_dims['xlo'])
+            box_y = float(self.box_dims['yhi'] - self.box_dims['ylo'])
+            r = float(self.config.tip.r)
+        except (AttributeError, KeyError, TypeError):
+            return
+        cutoff = 12.0  # ~LJ interaction range (Å); a conservative periodic-image buffer
+        need_x = 2.0 * r + m * period_x + cutoff
+        need_y = 2.0 * r + m * period_y + cutoff
+        if box_x < need_x or box_y < need_y:
+            logger.warning(
+                "Tip PES scan_cells=%d may overlap the tip's periodic image: box "
+                "%.1f×%.1f Å vs needed ~%.1f×%.1f Å (2·r=%.1f + %d cells + %.0f Å buffer). "
+                "Enlarge [2D] x,y or reduce scan_cells.",
+                m, box_x, box_y, need_x, need_y, 2.0 * r, m, cutoff,
+            )
+
     def write_inputs(self, n_layers: int) -> None:
         """Render the self-contained static tip PES scan (single ``slide.in``).
 
-        The scan assembles the tip + sheet + substrate itself and places the rigid
-        tip at a fixed firm contact gap, so no separate ``system.in`` indentation
-        phase is generated. A true repulsive normal-load contact is not well-defined
-        for a compliant monolayer (it conforms to a pressed tip, so the normal force
-        stays attractive), and the forced static contact is essentially
-        load-independent — the deployable descriptor is this fixed firm contact. The
-        2 nN pathology lives in the dynamic friction *target*, not this scan.
+        The scan assembles the tip + sheet + substrate itself; no separate
+        ``system.in`` indentation phase is generated. Tip placement has two modes:
+
+        - ``pes.tip_load`` set (preferred): the tip self-calibrates its gap by
+          bisection until the reaction normal force hits the target load (nN), so
+          the scan runs at a firm, repulsive contact in the friction regime. The
+          gap→load calibration (``gap_load_calibration``) showed the fixed gap below
+          sits in the *attractive* well for every material, giving an adhesion — not
+          load — descriptor; the load setpoint is the deployable one.
+        - ``pes.tip_load`` unset: fall back to the fixed ``PES_TIP_CONTACT_GAP``.
+
+        Either way the recorded ``fz`` column reports the actually-achieved load
+        (compliant materials that cannot reach the target cap at the firmest gap).
         """
         logger.info("Writing tip PES scan inputs...")
 
         context = self.build_render_context(n_layers)
         rel_layer = str(self.relative_run_dir_layer[n_layers])
+        m = self._scan_cells()
+        period_x = _cell_period(self.sheet_unit_cell, "x")
+        period_y = _cell_period(self.sheet_unit_cell, "y")
+        self._warn_if_footprint_too_small(m, period_x, period_y)
         context.update({
-            'grid_n': self._grid_n(),
-            'period_x': _cell_period(self.sheet_unit_cell, "x"),
-            'period_y': _cell_period(self.sheet_unit_cell, "y"),
+            # M×M unit cells at grid_n points *per cell*: multiply both the scanned
+            # extent and the grid resolution by M (M=1 → unchanged single-cell scan).
+            'grid_n': self._grid_n() * m,
+            'period_x': period_x * m,
+            'period_y': period_y * m,
             'z_relax': self._z_relax(),
+            # Contact gap (Å). The constant-load campaign runner overrides this per
+            # material by patching the rendered script's approach line to the gap that
+            # lands the grid-mean load on target (see gap_load_calibration/).
             'contact_gap': PES_TIP_CONTACT_GAP,
             'results_csv': f"{rel_layer}/results/pes_scan.csv",
             'ev_a_to_nn': EV_A_TO_NN,

@@ -22,13 +22,15 @@ from .path_utils import format_dimension_token
 from ..builders.afm import AFMSimulation
 from ..builders.sheetonsheet import SheetOnSheetSimulation
 from ..builders.pes_scan import PESSheetSimulation, PESTipSimulation
+from ..builders.indent import IndentSimulation
 from ..hpc import HPCScriptGenerator, HPCConfig
 
 logger = logging.getLogger(__name__)
 
 #: Simulation models sharing the AFM stack (tip + sheet + substrate) and its
-#: two-phase system.in → slide.in layout.
-AFM_LIKE_MODELS = frozenset({'afm', 'pes_tip'})
+#: two-phase system.in → slide.in layout. The indent reuses the AFM build and
+#: system.in indentation, replacing only the run phase (a hold + retract, no slide).
+AFM_LIKE_MODELS = frozenset({'afm', 'pes_tip', 'indent'})
 #: Simulation models sharing the sheet-on-sheet stack (single slide.in run).
 SHEET_LIKE_MODELS = frozenset({'sheetonsheet', 'pes_sheet'})
 
@@ -420,7 +422,8 @@ def run_simulations(
                 config_obj = AFMSimulationConfig(**run_dict)
                 config_json_path = prov_dir / 'config.json'
                 config_json_path.write_text(config_obj.model_dump_json(indent=2), encoding='utf-8')
-                builder_cls = PESTipSimulation if model == 'pes_tip' else AFMSimulation
+                afm_builders = {'pes_tip': PESTipSimulation, 'indent': IndentSimulation}
+                builder_cls = afm_builders.get(model, AFMSimulation)
                 builder = builder_cls(config_obj, output_dir, config_path=str(config_json_path))
             else:
                 config_obj = SheetOnSheetSimulationConfig(**run_dict)

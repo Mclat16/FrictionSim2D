@@ -39,22 +39,35 @@ fix             tip_hold tip_all setforce 0.0 0.0 0.0
 # --- 1) settle sheet + substrate with the tip held clear --------------------------
 compute         cz_tip tip_all reduce min z
 compute         cz_sheet 2D_all reduce max z
+# Surface the reduce computes in thermo so they are actually invoked. A compute
+# referenced only by an equal-style variable is never evaluated during minimize/run,
+# so reading the approach variable then errors ("compute used in variable between
+# runs is not current"). Naming them in thermo_style forces the zero-step run below
+# to invoke them; run 0 moves nothing, so the placed geometry is unchanged.
+thermo_style    custom step pe c_cz_tip c_cz_sheet
 {{ minimization_command }}
+run             0
 
-# --- 2) place the (rigid) tip at a fixed firm contact gap above the sheet ----------
+# --- 2) place the (rigid) tip at the contact gap above the sheet -------------------
 # The tip is built well above the sheet; measure the current tip-bottom / sheet-top
-# z and translate the rigid tip down to a fixed contact gap. Deterministic and
-# per-material; a compliant monolayer conforms to a pressed tip so a fixed gap is a
-# cleaner, load-independent contact than a force setpoint.
+# z and translate the rigid tip down to the contact gap, then relax the sheet +
+# substrate under it. The gap is set by the builder: either the fixed fallback gap,
+# or (for a constant-load campaign) a per-material gap pre-calibrated so the grid-mean
+# normal load hits the target — the campaign runner picks it from each material's
+# fz(gap) curve, since the grid-mean load can only be known from a full scan.
 variable        approach equal (c_cz_tip-c_cz_sheet)-{{ contact_gap }}
 displace_atoms  tip_all move 0.0 0.0 $(-v_approach) units box
-# relax the sheet + substrate under the tip at the fixed contact
 {{ minimization_command }}
 
-# --- 3) lateral force the surface exerts on the (rigid, held) tip ------------------
+# --- 3) force the surface exerts on the (rigid, held) tip --------------------------
 # setforce stores the total group force *before* zeroing in f_tip_hold[1..3].
+# fx, fy are the lateral (friction) signal; fz is the normal force = the actual
+# load the tip carries at this fixed contact gap (positive = repulsive/pushing the
+# tip up). It is not a setpoint here, but recording it tells us what load the
+# fixed-gap contact actually corresponds to, per material and per grid point.
 variable        fx equal f_tip_hold[1]*{{ ev_a_to_nn }}
 variable        fy equal f_tip_hold[2]*{{ ev_a_to_nn }}
+variable        fz equal f_tip_hold[3]*{{ ev_a_to_nn }}
 
 # --- lateral scan grid over one surface unit cell ---------------------------------
 variable        Nx     equal {{ grid_n }}
@@ -64,8 +77,9 @@ variable        Ly     equal {{ period_y }}
 variable        dxstep equal v_Lx/v_Nx
 variable        dystep equal v_Ly/v_Ny
 
-# CSV: x, y in Angstrom (tip displacement); energy_eV total; fx, fy in nN.
-print           "x,y,energy_eV,fx,fy" file {{ results_csv }} screen no
+# CSV: x, y in Angstrom (tip displacement); energy_eV total; fx, fy, fz in nN
+# (fz = normal load carried at the fixed contact gap).
+print           "x,y,energy_eV,fx,fy,fz" file {{ results_csv }} screen no
 
 # Move the tip only by the delta from the previous grid point to the current one.
 variable        prev_dx equal 0.0
@@ -86,7 +100,7 @@ variable        prev_dy equal $(v_dy)
 run             0
 {% endif %}
 variable        pe_now equal pe
-print           "$(v_dx),$(v_dy),$(v_pe_now),$(v_fx),$(v_fy)" append {{ results_csv }} screen no
+print           "$(v_dx),$(v_dy),$(v_pe_now),$(v_fx),$(v_fy),$(v_fz)" append {{ results_csv }} screen no
 next            iy
 jump            SELF loop_iy
 next            ix

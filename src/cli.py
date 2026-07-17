@@ -209,6 +209,38 @@ def run_pes_tip(config_file: str, settings_file: Optional[Path], output_dir: str
     )
 
 
+@run_group.command('indent')
+@click.argument('config_file', type=click.Path(exists=True))
+@click.option('--settings-file', type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None,
+              help='Path to a settings.yaml file for this run only.')
+@click.option('--output-dir', '-o', default='simulation_output',
+              help='Output directory for generated files')
+@click.option('--aiida', 'use_aiida', is_flag=True,
+              help='Enable AiiDA provenance tracking')
+@click.option('--hpc-scripts', 'generate_hpc', is_flag=True,
+              help='Generate HPC scripts for the simulation root')
+def run_indent(config_file: str, settings_file: Optional[Path], output_dir: str,
+               use_aiida: bool, generate_hpc: bool):
+    """Generate AFM indentation ("indent") simulation files: hold + pull-off retract.
+
+    The standard AFM build + indentation ramp (system.in) to each load in
+    [general] force, then per load a damped finite-T hold followed by a
+    displacement-controlled quasi-static retract of the rigid tip to full
+    detachment — the sliding phase is never invoked. Records both the penetration
+    channels (tip_z − sheet_com_z, vertical compliance) and the force–distance
+    retract curve (pull-off force, work of adhesion, contact stiffness). Uses a
+    fresh, recorded velocity seed per (material, layer). Subsumes the former
+    separate poke (hold-only) and adhesion (retract-only) commands.
+
+    Example:
+        FrictionSim2D run indent examples/indent_config.ini -o ./indent_output --hpc-scripts
+    """
+    _run_simulation(
+        'indent', config_file, output_dir, use_aiida, generate_hpc, settings_file=settings_file
+    )
+
+
 def _register_simulations_aiida(simulation_dirs: List[Path], config_path: Path):
     """Register generated simulations with AiiDA."""
     try:
@@ -1129,6 +1161,39 @@ def postprocess_pes_scan(run_root: Path, data_dir: Path, grid_dir: Optional[Path
         click.echo(f"✅ {k}: wrote descriptors -> {path.resolve()}")
     if grid_dir is not None:
         click.echo(f"📂 Grids copied under {Path(grid_dir).resolve()}/{{sheet,tip}}/")
+
+
+@postprocess_group.command('indent')
+@click.argument('run_root', type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option('--out-dir', '-o', type=click.Path(path_type=Path), default='outputs/poke_sims',
+              help='Destination for output_indent_f*_s*.json, indent/<material>_l<layer>.csv '
+                   'and indent_manifest.csv.')
+@click.option('--data-dir', '-d', type=click.Path(path_type=Path), default=None,
+              help='Destination for indent_features.csv (default: same as --out-dir).')
+def postprocess_indent(run_root: Path, out_dir: Path, data_dir: Optional[Path]):
+    """Reduce an indent run to penetration JSON + adhesion features + a manifest.
+
+    Delivers both descriptor sets from the one hold+retract run:
+      - penetration: output_indent_f<load>_s<seed>.json per load (nested campaign
+        schema, read by the ML side exactly like the sliding campaign);
+      - adhesion: indent_features.csv (pull-off force, work of adhesion, contact
+        stiffness, keyed material/layer/load) + tidied per-condition retract
+        curves indent/<material>_l<layer>.csv;
+      - indent_manifest.csv (material, layer, load, seed, hold_steps, z_step,
+        n_steps, wall_time).
+
+    Example:
+        FrictionSim2D postprocess indent ./indent_output/simulation_YYYYMMDD_HHMMSS \\
+            --out-dir outputs/poke_sims --data-dir data
+    """
+    from .postprocessing import indent as indent_pp  # noqa: PLC0415
+
+    written = indent_pp.run(run_root, out_dir, data_dir=data_dir)
+    if not written:
+        click.echo(f"No indent results found under {run_root}.", err=True)
+        return
+    for name, path in written.items():
+        click.echo(f"✅ {name} -> {path.resolve()}")
 
 
 # =============================================================================

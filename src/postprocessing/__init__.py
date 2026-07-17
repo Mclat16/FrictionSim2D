@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .plot_data import Plotter
     from .read_data import DataReader
     from . import pes_scan
+    from . import indent
 
 
 def __getattr__(name: str):
@@ -27,10 +28,14 @@ def __getattr__(name: str):
     if name == 'pes_scan':
         import importlib
         return importlib.import_module('.pes_scan', __name__)
+    if name == 'indent':
+        import importlib
+        return importlib.import_module('.indent', __name__)
     raise AttributeError(f"module {__name__!s} has no attribute {name!r}")
 
 __all__ = [
     'DataReader',
     'Plotter',
     'pes_scan',
+    'indent',
 ]

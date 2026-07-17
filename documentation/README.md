@@ -14,6 +14,7 @@ This folder contains user documentation for FrictionSim2D, a package that genera
 
 - [essentials.md](essentials.md): simulation lifecycle, run layout, and common patterns
 - [pes_scan.md](pes_scan.md): static potential-energy-surface (corrugation-barrier) scans
+- [indent.md](indent.md): AFM indentation ("indent") sims — penetration/compliance (hold) + adhesion/pull-off (retract) in one run
 - [settings_reference.md](settings_reference.md): global settings used during generation
 - [aiida_workflows.md](aiida_workflows.md): AiiDA setup, submission, and result import
 - [python_api_guide.md](python_api_guide.md): programmatic usage from Python
