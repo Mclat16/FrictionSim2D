@@ -24,16 +24,6 @@ balance         1.0 rcb
 
 min_style       {{ min_style }}
 
-{% if eval_mode == 'md' %}
-# Finite-T evaluation: thermostat the layer_2 band, integrate the mobile slab.
-group           slab_mobile subtract all layer_1 tip_all
-compute         t_band layer_2 temp
-fix             nve_slab slab_mobile nve
-fix             lang_band layer_2 langevin {{ temp }} {{ temp }} $(100.0*dt) 48279 zero yes
-fix_modify      lang_band temp t_band
-fix             ave_pe all ave/time 10 {{ (md_steps // 10) }} {{ md_steps }} v_fx v_fy v_fz c_thermo_pe mode scalar
-{% endif %}
-
 # layer_1 (bottom slab layer) is the fixed anchor; tip is held rigid throughout.
 fix             slab_anchor layer_1 setforce 0.0 0.0 0.0
 fix             tip_hold tip_all setforce 0.0 0.0 0.0
@@ -54,6 +44,18 @@ displace_atoms  tip_all move 0.0 0.0 $(-v_approach) units box
 variable        fx equal f_tip_hold[1]*{{ ev_a_to_nn }}
 variable        fy equal f_tip_hold[2]*{{ ev_a_to_nn }}
 variable        fz equal f_tip_hold[3]*{{ ev_a_to_nn }}
+
+{% if eval_mode == 'md' %}
+# Finite-T evaluation: thermostat the layer_2 band, integrate the mobile slab.
+# Placed AFTER v_fx/v_fy/v_fz are defined, since fix ave/time references them.
+group           slab_mobile subtract all layer_1 tip_all
+compute         t_band layer_2 temp
+fix             nve_slab slab_mobile nve
+fix             lang_band layer_2 langevin {{ temp }} {{ temp }} $(100.0*dt) 48279 zero yes
+fix_modify      lang_band temp t_band
+reset_timestep  0
+fix             ave_pe all ave/time 1 {{ md_steps }} {{ md_steps }} v_fx v_fy v_fz c_thermo_pe mode scalar
+{% endif %}
 
 # --- lateral scan grid over one surface unit cell --------------------------------
 variable        Nx     equal {{ grid_n }}
