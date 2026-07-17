@@ -124,6 +124,38 @@ def test_hetero_type_blocks_disjoint_and_potentials_complete(tmp_path):
     assert a_ids.isdisjoint(b_ids)                      # no overlap
     union = a_ids | b_ids
     assert union == set(range(1, max(union) + 1))       # contiguous from 1, no gaps
+
+    # --- Emitted masses are correct for EVERY type (range-emission + override) ---
+    # `get_masses_string` emits ranges (e.g. `mass 2*5 #S`) that can transiently
+    # engulf a type a later line overrides (`mass 3 #W`). A run-0 energy does NOT
+    # validate mass values, so assert the FINAL mass per type (last matching
+    # `mass` line wins, LAMMPS semantics) equals its element's standard mass.
+    from ase.data import atomic_masses, atomic_numbers
+    n_types = len(union)
+    final_mass: dict[int, float] = {}
+    final_elem: dict[int, str] = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("mass"):
+            continue
+        parts = s.split()
+        spec, val = parts[1], float(parts[2])
+        elem = s.split("#", 1)[1].strip().split()[0] if "#" in s else None
+        if "*" in spec:
+            lo_s, hi_s = spec.split("*")
+            lo, hi = (int(lo_s) if lo_s else 1), (int(hi_s) if hi_s else n_types)
+        else:
+            lo = hi = int(spec)
+        for t in range(lo, hi + 1):
+            final_mass[t], final_elem[t] = val, elem
+    assert set(final_mass) == set(range(1, n_types + 1))   # every type got a mass
+    for t in range(1, n_types + 1):
+        el = final_elem[t]
+        assert el is not None and final_mass[t] > 0
+        expected = atomic_masses[atomic_numbers[el]]
+        assert abs(final_mass[t] - expected) < 0.5, (
+            f"type {t} ({el}) got mass {final_mass[t]}, expected ~{expected:.2f}"
+        )
     assert len(union) == len(hp.pm.types)               # covers every registered type
 
     # Cross-check against the live registry and the read_data offsets.
@@ -212,8 +244,8 @@ def test_sheared_nonidentity_match_builds_coinciding_boxes(tmp_path):
     assert stack.match.matrix_a[0, 1] != 0 or stack.match.matrix_b[0, 1] != 0
 
     # Metadata (per-atom charges) survives the build for both materials.
-    qa = read(str(stack.supercell_a), format="lammps-data", style="charge").get_initial_charges()
-    qb = read(str(stack.supercell_b), format="lammps-data", style="charge").get_initial_charges()
+    qa = read(str(stack.supercell_a), format="lammps-data", atom_style="charge").get_initial_charges()
+    qb = read(str(stack.supercell_b), format="lammps-data", atom_style="charge").get_initial_charges()
     assert np.allclose(np.abs(qa), np.abs(qa[0]))
     assert np.allclose(np.abs(qb), np.abs(qb[0]))
     assert np.any(qa != 0) and np.any(qb != 0)
@@ -419,3 +451,28 @@ def test_end_to_end_structure_assembles_in_lammps(tmp_path):
     # --- real LAMMPS run 0: finite, physical energy; no lost atoms (in helper) --
     energy = _lammps_run0_energy(stack.data_path, stack.settings_path)
     assert np.isfinite(energy) and abs(energy) < 1e6  # physical, not exploded (~1e9 = failure)
+
+
+def test_lattice_match_config_is_threaded_into_build(tmp_path):
+    """``build_hetero_structure`` must thread the ``[lattice_match]`` section into
+    the coincidence search (design §5), not use hardcoded defaults.
+
+    Proof: a ``strain_tol`` far tighter than the ~0.03% MoS2/WS2 mismatch turns
+    the otherwise-successful match into a fail-loud, and the raised error reports
+    *that* tolerance -- so the config value reached the matcher (with the 2%
+    default the match would succeed). Fails at the match step, before any LAMMPS
+    run, so it is fast.
+    """
+    raw = {
+        "general": {"temp": 300, "scan_speed": 1, "hetero_stacking": "grouped"},
+        "2D-1": {"mat": "h-MoS2", "cif_path": MOS2_CIF, "pot_path": MOS2_POT,
+                 "pot_type": "sw", "x": 4.0, "y": 4.0, "layers": [1]},
+        "2D-2": {"mat": "h-WS2", "cif_path": WS2_CIF, "pot_path": WS2_POT,
+                 "pot_type": "sw", "x": 4.0, "y": 4.0, "layers": [1]},
+        "lattice_match": {"strain_tol": 1e-6, "max_supercell": 3},
+    }
+    cfg = SheetOnSheetSimulationConfig(**raw, settings=load_settings())
+    assert cfg.lattice_match is not None and cfg.lattice_match.strain_tol == 1e-6
+
+    with pytest.raises(ValueError, match=r"strain_tol=0\.0001%"):
+        build_hetero_structure(cfg, cfg.settings, workdir=tmp_path)

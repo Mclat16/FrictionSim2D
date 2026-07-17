@@ -839,6 +839,16 @@ def assemble_hetero_stack(
         z_ext[m] = (zmn, zmx)
         if cell2 is None:
             cell2 = this_cell2
+        elif not np.allclose(this_cell2, cell2, atol=1e-4):
+            # The matched supercells MUST share one in-plane box (build_matched_
+            # supercells' guarantee). If they don't, stacking them into one cell
+            # would create a periodic seam -- fail loud rather than emit a
+            # silently mismatched structure.
+            raise ValueError(
+                "Matched supercells do not share one in-plane box "
+                f"(material {m} cell {this_cell2.tolist()} != {cell2.tolist()}); "
+                "cannot assemble a seamless periodic stack."
+            )
     assert cell2 is not None
     lx, ly, xy = float(cell2[0, 0]), float(cell2[1, 1]), float(cell2[1, 0])
 
@@ -1075,7 +1085,17 @@ def build_hetero_structure(
     mono_paths = [Path(build_monolayer(sheet)[0]) for sheet in sheets]
 
     # 2. Match + strain smaller onto larger -> two supercells, one shared box.
-    matched = build_matched_supercells(mono_paths[0], mono_paths[1], workdir)
+    #    Thread the optional [lattice_match] config through to the coincidence
+    #    search; when unset, build_matched_supercells' own defaults apply. This
+    #    is the knob a user needs to build genuinely different-lattice pairs
+    #    (a wider strain_tol / larger max_supercell than the 2% / 10 defaults).
+    lm = config.lattice_match
+    match_kwargs = (
+        dict(strain_tol=lm.strain_tol, max_supercell=lm.max_supercell, area_tol=lm.area_tol)
+        if lm is not None
+        else {}
+    )
+    matched = build_matched_supercells(mono_paths[0], mono_paths[1], workdir, **match_kwargs)
 
     # 3. Register the materials' potential/type spine (geometry-independent).
     hetero_potentials = register_hetero_potentials(sheets, settings, workdir)
