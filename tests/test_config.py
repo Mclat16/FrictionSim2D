@@ -303,13 +303,16 @@ def test_afm_config_sub_optional(tmp_path):
 
 
 def test_afm_config_freestanding_skips_amorph_requirement(tmp_path):
-    # No [sub] + non-finite must NOT raise the amorphous-substrate error.
-    cfg = AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=False, finite_sheet=False))
-    assert cfg.sub is None
+    # The amorphous-substrate requirement is skipped specifically because the
+    # substrate is ABSENT (sub is None), not blanket-removed: a no-[sub] config
+    # is accepted, while the same config WITH a crystalline substrate still raises.
+    free = AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=False, finite_sheet=False))
+    assert free.sub is None
+    with pytest.raises(ValueError, match="amorphous substrate"):
+        AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=True, sub_amorph="c", finite_sheet=False))
 
 
 def test_afm_config_nonamorph_sub_still_rejected(tmp_path):
-    import pytest
     with pytest.raises(ValueError, match="amorphous substrate"):
         AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=True, sub_amorph="c", finite_sheet=False))
 
