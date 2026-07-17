@@ -62,3 +62,31 @@ def test_freestanding_pes_requires_two_layers(tmp_path):
     builder = FreestandingPESTipSimulation(_free_cfg(tmp_path, layers=(1,)), output_dir=str(tmp_path / "o"))
     with pytest.raises(ValueError, match="layers"):
         builder.write_inputs(1)
+
+
+def test_freestanding_md_mode_emits_langevin_and_run(tmp_path, monkeypatch):
+    n = 4
+    builder = FreestandingPESTipSimulation(_free_cfg(tmp_path, layers=(n,), eval_mode="md"),
+                                           output_dir=str(tmp_path / "o"))
+    ctx = {
+        "atom_style": "atomic", "neighbor_list": 2.0,
+        "neigh_modify_command": "neigh_modify every 1 delay 0 check yes",
+        "thermo": 100, "timestep": 0.001, "xlo": 0.0, "xhi": 40.0, "ylo": 0.0, "yhi": 40.0,
+        "zhi_box": 120.0, "ngroups": 8, "tip_file": "build/tip.lmp", "sub_file": None,
+        "sheet_file": "build/sheet.lmp", "tip_x": 20.0, "tip_y": 20.0, "tip_z": 80.0,
+        "sheet_shift_x": 0.0, "sheet_shift_y": 0.0, "sheet_z": 5.0, "offset_2d": 2,
+        "potential_file": "lammps/system.in.settings", "min_style": "cg",
+        "minimization_command": "minimize 0.0 1.0e-6 10000 100000",
+        "contact_gap": 3.0, "ev_a_to_nn": 16.021766, "temp": 300.0,
+    }
+    monkeypatch.setattr(builder, "build_render_context", lambda n_layers: dict(ctx))
+    builder.sheet_unit_cell = {"xlo": 0.0, "xhi": 3.16, "ylo": 0.0, "yhi": 5.47}
+    builder.box_dims = {"xlo": 0.0, "xhi": 40.0, "ylo": 0.0, "yhi": 40.0}
+    builder.output_dir_layer = {n: tmp_path / "o" / f"L{n}"}
+    builder.relative_run_dir_layer = {n: Path(f"pes_tip/h-MoS2/L{n}")}
+
+    builder.write_inputs(n)
+    slide = (tmp_path / "o" / f"L{n}" / "lammps" / "slide.in").read_text(encoding="utf-8")
+    assert "langevin" in slide and "layer_2" in slide
+    assert "run             2000" in slide
+    assert "fix_ave" in slide or "ave/time" in slide  # per-point time averaging

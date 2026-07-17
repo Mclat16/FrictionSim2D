@@ -22,6 +22,14 @@ class FreestandingPESTipSimulation(PESTipSimulation):
     def _get_hpc_job_name(self) -> str:
         return f"pes_tip_free_{self.config.sheet.mat}"
 
+    def _eval_mode(self) -> str:
+        pes = getattr(self.config, 'pes', None)
+        return getattr(pes, 'eval_mode', 'minimize') if pes is not None else 'minimize'
+
+    def _md_steps(self) -> int:
+        pes = getattr(self.config, 'pes', None)
+        return int(getattr(pes, 'md_steps', 2000)) if pes is not None else 2000
+
     def write_inputs(self, n_layers: int) -> None:
         """Render the freestanding tip PES scan to ``lammps/slide.in``."""
         logger.info("Writing freestanding tip PES scan inputs...")
@@ -46,6 +54,8 @@ class FreestandingPESTipSimulation(PESTipSimulation):
             'results_csv': f"{rel_layer}/results/pes_scan.csv",
             'ev_a_to_nn': EV_A_TO_NN,
             'minimization_command': PES_MINIMIZE_COMMAND,
+            'eval_mode': self._eval_mode(),
+            'md_steps': self._md_steps(),
         })
 
         out_dir = self.output_dir_layer[n_layers]

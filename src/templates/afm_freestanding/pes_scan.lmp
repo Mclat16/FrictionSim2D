@@ -24,6 +24,16 @@ balance         1.0 rcb
 
 min_style       {{ min_style }}
 
+{% if eval_mode == 'md' %}
+# Finite-T evaluation: thermostat the layer_2 band, integrate the mobile slab.
+group           slab_mobile subtract all layer_1 tip_all
+compute         t_band layer_2 temp
+fix             nve_slab slab_mobile nve
+fix             lang_band layer_2 langevin {{ temp }} {{ temp }} $(100.0*dt) 48279 zero yes
+fix_modify      lang_band temp t_band
+fix             ave_pe all ave/time 10 {{ (md_steps // 10) }} {{ md_steps }} v_fx v_fy v_fz c_thermo_pe mode scalar
+{% endif %}
+
 # layer_1 (bottom slab layer) is the fixed anchor; tip is held rigid throughout.
 fix             slab_anchor layer_1 setforce 0.0 0.0 0.0
 fix             tip_hold tip_all setforce 0.0 0.0 0.0
@@ -67,9 +77,15 @@ variable        dy equal (v_iy-1)*v_dystep
 displace_atoms  tip_all move $(v_dx-v_prev_dx) $(v_dy-v_prev_dy) 0.0 units box
 variable        prev_dx equal $(v_dx)
 variable        prev_dy equal $(v_dy)
+{% if eval_mode == 'md' %}
+run             {{ md_steps }}
+variable        pe_now equal f_ave_pe[4]
+print           "$(v_dx),$(v_dy),$(v_pe_now),$(f_ave_pe[1]),$(f_ave_pe[2]),$(f_ave_pe[3])" append {{ results_csv }} screen no
+{% else %}
 {{ minimization_command }}
 variable        pe_now equal pe
 print           "$(v_dx),$(v_dy),$(v_pe_now),$(v_fx),$(v_fy),$(v_fz)" append {{ results_csv }} screen no
+{% endif %}
 next            iy
 jump            SELF loop_iy
 next            ix
