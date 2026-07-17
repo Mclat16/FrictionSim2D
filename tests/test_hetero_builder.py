@@ -22,7 +22,11 @@ from ase import Atoms
 from ase.io import read, write
 
 from src.builders import components
-from src.builders.hetero import build_matched_supercells, register_hetero_potentials
+from src.builders.hetero import (
+    assemble_hetero_stack,
+    build_matched_supercells,
+    register_hetero_potentials,
+)
 from src.core.config import SheetConfig, load_settings
 from src.core.lattice_matching import find_coincidence_lattice
 
@@ -227,3 +231,82 @@ def test_incommensurate_pair_raises_instead_of_silently_mismatching(tmp_path):
         build_matched_supercells(
             mono_a, mono_b, workdir=tmp_path, strain_tol=0.005, max_supercell=2, area_tol=0.02,
         )
+
+
+def _wrap_vec_mod_cell(vec, cell_2x2):
+    """Wrap a 2-D Cartesian vector into the primitive cell (nearest-image)."""
+    inv = np.linalg.inv(np.asarray(cell_2x2, dtype=float))
+    frac = np.asarray(vec, dtype=float) @ inv
+    frac -= np.round(frac)
+    return frac @ np.asarray(cell_2x2, dtype=float)
+
+
+def test_hetero_stack_is_periodic_and_complete(tmp_path):
+    """Assemble two matched supercells into ONE periodic LAMMPS cell and verify
+    the built geometry: correct atom count, a physical (ordered, non-overlapping,
+    non-exploded) z-extent, a single shared in-plane box (no seam), and -- the
+    key regression guard -- the cross-material RI offset SURVIVES placement (the
+    old branch re-centered both materials' centroids, cancelling it).
+    """
+    # The two pre-aligned supercells are already in AA (max-RI) registry at zero
+    # shift, so AA would give a (0, 0) offset that cannot exercise the survival
+    # guard. AB (anti-registry) is a genuine, non-zero half-cell shift -- use it
+    # so the guard is meaningful. Only the non-reference (top) material's
+    # stack_type drives the cross-material offset; set both for robustness.
+    sheets = [
+        _sheet_config("h-MoS2", MOS2_CIF, MOS2_POT).model_copy(update={"stack_type": "AB"}),
+        _sheet_config("h-WS2", WS2_CIF, WS2_POT).model_copy(update={"stack_type": "AB"}),
+    ]
+    settings = load_settings()
+
+    mono_a = _build_small_monolayer("h-MoS2", MOS2_CIF, MOS2_POT)
+    mono_b = _build_small_monolayer("h-WS2", WS2_CIF, WS2_POT)
+
+    matched = build_matched_supercells(
+        mono_a, mono_b, workdir=tmp_path, strain_tol=0.05, max_supercell=6,
+    )
+    hp = register_hetero_potentials(sheets, settings, workdir=tmp_path)
+
+    stack = assemble_hetero_stack(matched, sheets, hp, "grouped", settings, workdir=tmp_path)
+
+    # --- total atoms == sum of both matched supercells (1 layer each) ---
+    na = len(read(str(matched.supercell_a), format="lammps-data"))
+    nb = len(read(str(matched.supercell_b), format="lammps-data"))
+    expected_total = na + nb
+
+    at = read(str(stack.data_path), format="lammps-data")
+    assert len(at) == expected_total
+
+    # --- distinct, ordered, non-overlapping, non-exploded z stacking ---
+    zc = at.get_positions()[:, 2]
+    zext = zc.max() - zc.min()
+    assert 4.0 < zext < 20.0
+
+    # --- single shared periodic in-plane box (matches the matched supercell) ---
+    matched_box_2x2 = np.array(read(str(matched.supercell_a), format="lammps-data").cell)[:2, :2]
+    assert np.allclose(np.array(at.cell)[:2, :2], matched_box_2x2, atol=1e-4)
+
+    # --- RI-offset-survival regression guard ---------------------------------
+    # Identify (via the stack's own bookkeeping) which stacked layers belong to
+    # the reference vs the displaced non-reference material, split the atoms by
+    # z accordingly, and check the applied lateral offset actually survives.
+    ref_z = np.mean([l.z for l in stack.layers if l.material_index == stack.reference_index])
+    non_z = np.mean([l.z for l in stack.layers if l.material_index == stack.nonreference_index])
+    # The two materials form two well-separated z-clusters; split the ACTUAL
+    # atom z at the midpoint of their range. The material placed at the lower
+    # z-shift is the lower atom cluster.
+    z_split = 0.5 * (zc.min() + zc.max())
+    xy = at.get_positions()[:, :2]
+    low_xy, high_xy = xy[zc < z_split], xy[zc >= z_split]
+    if non_z < ref_z:
+        non_xy, ref_xy = low_xy, high_xy
+    else:
+        non_xy, ref_xy = high_xy, low_xy
+
+    diff = non_xy.mean(axis=0) - ref_xy.mean(axis=0)
+    offset = np.asarray(stack.ri_offset, dtype=float)
+
+    # (a) the non-reference material sits at the intended RI offset (mod cell)...
+    assert np.linalg.norm(_wrap_vec_mod_cell(diff - offset, matched_box_2x2)) < 1e-2
+    # (b) ...and that offset is genuinely non-zero -- NOT centroid-cancelled.
+    assert np.linalg.norm(_wrap_vec_mod_cell(offset, matched_box_2x2)) > 0.5

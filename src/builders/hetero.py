@@ -36,6 +36,7 @@ they now share an identical cell), so their on-disk boxes coincide exactly.
 """
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -45,10 +46,18 @@ from ase import Atoms
 from ase.build import make_supercell
 from ase.data import atomic_masses, atomic_numbers, chemical_symbols
 from ase.io import read, write
+from jinja2 import Environment
 
 from ..core.config import GlobalSettings, SheetConfig
-from ..core.lattice_matching import MatchResult, _max_strain, find_coincidence_lattice
+from ..core.lattice_matching import (
+    MatchResult,
+    _max_strain,
+    find_coincidence_lattice,
+    scan_registry_index,
+)
 from ..core.potential_manager import PotentialManager
+from ..interfaces.jinja import PackageLoader
+from .components import calculate_layer_shifts
 
 PathLike = Union[str, Path]
 
@@ -535,4 +544,460 @@ def build_matched_supercells(
         strain_reference=0.0,
         strain_applied=strain,
         match=match,
+    )
+
+
+# =============================================================================
+# Stack assembly: two matched supercells -> one periodic hetero cell
+# =============================================================================
+
+
+@dataclass
+class HeteroStackLayer:
+    """One placed layer in the assembled heterostructure.
+
+    Attributes:
+        material_index: 0-based material index (0 = supercell_a, 1 = supercell_b).
+        layer_index: 0-based layer within that material.
+        z: z-shift (Å) applied to this layer's supercell when read into the box.
+        xy_offset: In-plane displacement (Å) applied to this layer = the
+            material's cross-material RI anchor + this layer's intra-material
+            AA/AB shift. The reference material's anchor is (0, 0); the
+            non-reference material's anchor is the surviving RI offset.
+        group: LAMMPS group name assigned to this layer's atoms.
+        type_offset: read_data atom-type offset used for this layer (from the
+            PotentialManager, so assembled global types match the spine).
+        source: Path to the per-material supercell data file this layer was
+            read from.
+    """
+    material_index: int
+    layer_index: int
+    z: float
+    xy_offset: Tuple[float, float]
+    group: str
+    type_offset: int
+    source: Path
+
+
+@dataclass
+class HeteroStack:
+    """Result of assembling the matched supercells into one periodic cell.
+
+    Attributes:
+        data_path: Path to the single written ``hetero.data`` (all layers of
+            both materials in one shared in-plane periodic box).
+        settings_path: The real potential settings (carried through from
+            :class:`HeteroPotentials`) that describe the written types/masses.
+        layers: Per-layer bookkeeping (material/layer index, z, xy offset,
+            group, type offset, source) for a later sim builder.
+        ri_offset: The cross-material Registry-Index offset (Å) actually applied
+            to the non-reference material's layers (one-sided; NOT
+            centroid-cancelled). Non-zero for AB / off-registry stackings.
+        reference_index: Material index left unshifted in-plane (the larger,
+            unstrained reference lattice from Task 3).
+        nonreference_index: Material index carrying ``ri_offset``.
+        interface_spacing: Cross-material interlayer COM z-gap (Å) found by real
+            minimization with the registered potential.
+        stacking: The requested layer ordering ('grouped' or 'alternating').
+        total_types: Number of global atom types in the assembled cell
+            (== len(pm.types)).
+        material_offsets: Per-material in-plane anchor (Å) applied to all of
+            that material's layers.
+    """
+    data_path: Path
+    settings_path: Path
+    layers: List[HeteroStackLayer]
+    ri_offset: np.ndarray
+    reference_index: int
+    nonreference_index: int
+    interface_spacing: float
+    stacking: str
+    total_types: int
+    material_offsets: Dict[int, np.ndarray]
+
+
+def _run_lammps(workdir: Path, script_path: Path) -> str:
+    """Run ``lmp_serial`` on a script with ``cwd = workdir`` and return stdout.
+
+    Running from ``workdir`` is mandatory: the settings file's ``pair_coeff``
+    lines reference the staged potentials by the run-dir-relative prefix
+    ``provenance/potentials/...``, so those paths only resolve when LAMMPS'
+    working directory is the run dir.
+
+    Raises:
+        RuntimeError: If LAMMPS exits non-zero (with a tail of stdout/stderr).
+    """
+    result = subprocess.run(
+        ["lmp_serial", "-in", str(script_path), "-log", "none"],
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        tail_out = "\n".join(result.stdout.splitlines()[-30:])
+        tail_err = "\n".join(result.stderr.splitlines()[-30:])
+        raise RuntimeError(
+            f"LAMMPS run failed (exit {result.returncode}) for "
+            f"'{script_path.name}' in {workdir}.\n"
+            f"--- stdout (tail) ---\n{tail_out}\n"
+            f"--- stderr (tail) ---\n{tail_err}"
+        )
+    return result.stdout
+
+
+def _box_region_cmd(lx: float, ly: float, xy: float, zlo: float, zhi: float) -> str:
+    """LAMMPS ``region box ...`` command reproducing the shared in-plane box.
+
+    Uses a ``prism`` region when the shared box is sheared (non-zero xy tilt),
+    else a plain ``block`` region.
+    """
+    if abs(xy) > 1e-9:
+        return (
+            f"region box prism 0.0 {lx:.6f} 0.0 {ly:.6f} "
+            f"{zlo:.6f} {zhi:.6f} {xy:.6f} 0.0 0.0"
+        )
+    return f"region box block 0.0 {lx:.6f} 0.0 {ly:.6f} {zlo:.6f} {zhi:.6f}"
+
+
+def _read_layer_geometry(path: Path) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """Return (in-plane Cartesian xy, 2x2 cell, z-min, z-max) of a supercell."""
+    at = read(str(path), format="lammps-data")
+    pos = at.get_positions()
+    cell2 = np.array(at.cell)[:2, :2]
+    return pos[:, :2], cell2, float(pos[:, 2].min()), float(pos[:, 2].max())
+
+
+def _minimize_interface_gap(
+    *,
+    workdir: Path,
+    settings: GlobalSettings,
+    settings_path: Path,
+    atom_style: str,
+    total_types: int,
+    masses_block: str,
+    lx: float,
+    ly: float,
+    xy: float,
+    bot_path: Path,
+    bot_off: int,
+    bot_zext: Tuple[float, float],
+    top_path: Path,
+    top_off: int,
+    top_zext: Tuple[float, float],
+    top_shift_xy: np.ndarray,
+    initial_guess: float,
+) -> float:
+    """Find one interface's interlayer COM z-gap by REAL minimization.
+
+    Builds a 2-layer trial (bottom layer at z=0, top layer at ``initial_guess``
+    with the interface's relative in-plane offset applied), includes the real
+    registered potential, minimizes at fixed box, and reads the COM z-gap
+    ``xcm(g2,z) - xcm(g1,z)`` -- mirroring the ``stack_multilayer_sheet`` idiom.
+    """
+    zlo = min(bot_zext[0], top_zext[0]) - 10.0
+    zhi = max(bot_zext[1], top_zext[1] + initial_guess) + 10.0
+    box_region = _box_region_cmd(lx, ly, xy, zlo, zhi)
+
+    dx, dy = float(top_shift_xy[0]), float(top_shift_xy[1])
+    disp = ""
+    if abs(dx) > 1e-12 or abs(dy) > 1e-12:
+        disp = f"displace_atoms  g2 move {dx:.6f} {dy:.6f} 0.0 units box\n"
+
+    script = f"""clear
+units           metal
+atom_style      {atom_style}
+boundary        p p p
+
+{box_region}
+create_box      {total_types} box
+
+read_data       {bot_path} add append shift 0.0 0.0 0.0 group g1 offset {bot_off} 0 0 0 0 nocoeff
+read_data       {top_path} add append shift 0.0 0.0 {initial_guess:.6f} group g2 offset {top_off} 0 0 0 0 nocoeff
+{disp}{masses_block}
+include         {settings_path}
+run             0
+
+min_style       {settings.simulation.min_style}
+{settings.simulation.minimization_command}
+variable        z1 equal xcm(g1,z)
+variable        z2 equal xcm(g2,z)
+variable        lat_c equal v_z2-v_z1
+print           "RESULT_LAT_C ${{lat_c}}"
+"""
+    script_path = workdir / f"min_interface_{bot_off}_{top_off}.lmp"
+    script_path.write_text(script, encoding="utf-8")
+    out = _run_lammps(workdir, script_path)
+
+    value: Optional[float] = None
+    for line in out.splitlines():
+        if line.startswith("RESULT_LAT_C"):
+            value = float(line.split()[1])
+    if value is None:
+        raise RuntimeError(
+            f"Could not parse interface spacing (RESULT_LAT_C) from minimize "
+            f"trial '{script_path.name}'."
+        )
+    return abs(value)
+
+
+def assemble_hetero_stack(
+    matched: MatchedStack,
+    sheets: List[SheetConfig],
+    hetero_potentials: HeteroPotentials,
+    hetero_stacking: str,
+    settings: GlobalSettings,
+    workdir: PathLike,
+) -> HeteroStack:
+    """Stack two matched supercells into ONE genuinely-periodic LAMMPS cell.
+
+    Consumes the two per-material coincidence supercells (which already share
+    one in-plane box, Task 3) and the registered potential spine (Task 5), and
+    writes a single ``hetero.data`` with:
+
+    * **Cross-material registry (RI offset).** :func:`scan_registry_index` on the
+      two interface layers gives the AA (max-RI) / AB (min-RI) lateral offset;
+      the choice follows the non-reference (top) material's ``stack_type``. The
+      offset is applied as a **one-sided relative in-plane displacement of the
+      non-reference material's layers only** -- the reference stays at the
+      origin and the two materials are NEVER re-centered to a common centroid
+      (the old branch's bug, which cancelled the offset).
+    * **Per-interface z-spacing by real minimization.** For the cross-material
+      interface a 2-layer trial is minimized with the real registered potential
+      (:func:`_minimize_interface_gap`); the resulting COM z-gap is the interface
+      spacing (no fixed nominal gap).
+    * **Layer ordering.** ``'grouped'`` = all of material 0's layers then all of
+      material 1's; ``'alternating'`` interleaves. Each material's own
+      :func:`calculate_layer_shifts` gives its intra-material AA/AB shifts.
+    * **Exact type alignment.** Each layer is read with its
+      ``hetero_potentials.type_offsets`` so assembled global types match the PM.
+
+    Every LAMMPS invocation runs with ``cwd = workdir`` so the settings file's
+    run-dir-relative ``provenance/potentials/...`` references resolve.
+
+    Args:
+        matched: The two matched per-material supercells (Task 3).
+        sheets: Per-material sheet configs (exactly two; index 0 = supercell_a).
+        hetero_potentials: Registered potential spine (Task 5) supplying the
+            settings path and per-material type offsets.
+        hetero_stacking: ``'grouped'`` or ``'alternating'``.
+        settings: Global simulation settings.
+        workdir: Run directory (also where ``hetero.data`` is written).
+
+    Returns:
+        :class:`HeteroStack` with the written data path, the carried settings
+        path, per-layer bookkeeping, and the surviving RI offset.
+
+    Raises:
+        ValueError: On an unknown stacking, a material count other than two, an
+            empty layers list, or mixed atom styles.
+        RuntimeError: If a LAMMPS run fails or does not produce ``hetero.data``.
+    """
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    stacking = hetero_stacking.lower()
+    if stacking not in ("grouped", "alternating"):
+        raise ValueError(
+            f"hetero_stacking must be 'grouped' or 'alternating', got "
+            f"{hetero_stacking!r}."
+        )
+
+    n_mats = len(sheets)
+    if n_mats != 2:
+        raise ValueError(
+            f"assemble_hetero_stack builds one interface between exactly two "
+            f"matched materials (MatchedStack holds a pair); got {n_mats} sheets."
+        )
+
+    mat_paths = [Path(matched.supercell_a), Path(matched.supercell_b)]
+    type_offsets = list(hetero_potentials.type_offsets)
+
+    n_layers: List[int] = []
+    for sheet in sheets:
+        if not sheet.layers:
+            raise ValueError(f"SheetConfig for {sheet.mat!r} has an empty layers list.")
+        n_layers.append(int(sheet.layers[0]))
+
+    ref_index = 0 if matched.reference == "a" else 1
+    nonref_index = 1 - ref_index
+
+    styles = {_detect_atom_style(p) for p in mat_paths}
+    if len(styles) > 1:
+        raise ValueError(
+            f"Cannot assemble materials with differing atom_style {sorted(styles)} "
+            f"into one data file."
+        )
+    atom_style = styles.pop()
+
+    # In-plane geometry (shared box) + per-material atom xy / z-extent.
+    carts: Dict[int, np.ndarray] = {}
+    z_ext: Dict[int, Tuple[float, float]] = {}
+    cell2: Optional[np.ndarray] = None
+    for m, path in enumerate(mat_paths):
+        cart_xy, this_cell2, zmn, zmx = _read_layer_geometry(path)
+        carts[m] = cart_xy
+        z_ext[m] = (zmn, zmx)
+        if cell2 is None:
+            cell2 = this_cell2
+    assert cell2 is not None
+    lx, ly, xy = float(cell2[0, 0]), float(cell2[1, 1]), float(cell2[1, 0])
+
+    # Cross-material RI anchor: scan shifts its SECOND argument, so pass the
+    # reference material first and the non-reference second -> the returned
+    # offset displaces the non-reference material's layers (one-sided).
+    ri_result = scan_registry_index(carts[ref_index], carts[nonref_index], cell2)
+    top_stack_type = sheets[nonref_index].stack_type.upper()
+    ri_offset = np.array(
+        ri_result.aa_shift if top_stack_type == "AA" else ri_result.ab_shift,
+        dtype=float,
+    )
+    material_anchor: Dict[int, np.ndarray] = {
+        ref_index: np.zeros(2, dtype=float),
+        nonref_index: ri_offset,
+    }
+
+    # Intra-material AA/AB shifts (independent of the cross-material RI offset).
+    dims = {"xlo": 0.0, "xhi": lx, "ylo": 0.0, "yhi": ly, "zlo": 0.0, "zhi": 1.0}
+    intra_shifts: Dict[int, List[Tuple[float, float]]] = {}
+    for m in range(n_mats):
+        intra_shifts[m] = calculate_layer_shifts(
+            sheets[m].mat, dims, n_layers=n_layers[m], stacking_type=sheets[m].stack_type
+        )
+
+    # Layer ordering.
+    if stacking == "grouped":
+        seq = [(m, k) for m in range(n_mats) for k in range(n_layers[m])]
+    else:  # alternating
+        seq = []
+        for k in range(max(n_layers)):
+            for m in range(n_mats):
+                if k < n_layers[m]:
+                    seq.append((m, k))
+
+    total_types = len(hetero_potentials.pm.types)
+    masses_block = hetero_potentials.pm.get_masses_string()
+    settings_path = Path(hetero_potentials.settings_path)
+    initial_guess = settings.geometry.lat_c_default
+
+    # Per-interface spacing by real minimization, cached per distinct pair.
+    gap_cache: Dict[Tuple[int, int], float] = {}
+
+    def _gap(bot_m: int, top_m: int) -> float:
+        key = (bot_m, top_m)
+        if key in gap_cache:
+            return gap_cache[key]
+        if bot_m == top_m:
+            if n_layers[bot_m] > 1:
+                rel = np.array(intra_shifts[bot_m][1], dtype=float) - np.array(
+                    intra_shifts[bot_m][0], dtype=float
+                )
+            else:
+                rel = np.zeros(2, dtype=float)
+        else:
+            rel = material_anchor[top_m] - material_anchor[bot_m]
+        gap = _minimize_interface_gap(
+            workdir=workdir,
+            settings=settings,
+            settings_path=settings_path,
+            atom_style=atom_style,
+            total_types=total_types,
+            masses_block=masses_block,
+            lx=lx,
+            ly=ly,
+            xy=xy,
+            bot_path=mat_paths[bot_m],
+            bot_off=type_offsets[bot_m],
+            bot_zext=z_ext[bot_m],
+            top_path=mat_paths[top_m],
+            top_off=type_offsets[top_m],
+            top_zext=z_ext[top_m],
+            top_shift_xy=rel,
+            initial_guess=initial_guess,
+        )
+        gap_cache[key] = gap
+        return gap
+
+    # Place layers in z, accumulating per-interface gaps.
+    layers_spec: List[HeteroStackLayer] = []
+    z_cursor = 0.0
+    prev_m: Optional[int] = None
+    interface_spacing: Optional[float] = None
+    for idx, (m, k) in enumerate(seq):
+        if idx == 0:
+            z_layer = 0.0
+        else:
+            assert prev_m is not None
+            gap = _gap(prev_m, m)
+            z_cursor += gap
+            z_layer = z_cursor
+            if prev_m != m and interface_spacing is None:
+                interface_spacing = gap
+        anchor = material_anchor[m]
+        intra = intra_shifts[m][k] if k < len(intra_shifts[m]) else (0.0, 0.0)
+        layers_spec.append(
+            HeteroStackLayer(
+                material_index=m,
+                layer_index=k,
+                z=z_layer,
+                xy_offset=(float(anchor[0] + intra[0]), float(anchor[1] + intra[1])),
+                group=f"_m{m}l{k}",
+                type_offset=int(type_offsets[m]),
+                source=mat_paths[m],
+            )
+        )
+        prev_m = m
+
+    # Box z-window from the actual (shifted) atom extents so nothing wraps.
+    zmins = [z_ext[s.material_index][0] + s.z for s in layers_spec]
+    zmaxs = [z_ext[s.material_index][1] + s.z for s in layers_spec]
+    box_region = _box_region_cmd(lx, ly, xy, min(zmins) - 10.0, max(zmaxs) + 10.0)
+
+    # Render + run the assembly.
+    output_path = workdir / "hetero.data"
+    layers_ctx = [
+        {
+            "material_index": s.material_index,
+            "layer_index": s.layer_index,
+            "z": s.z,
+            "path": str(s.source),
+            "group": s.group,
+            "type_offset": s.type_offset,
+            "shift_x": s.xy_offset[0],
+            "shift_y": s.xy_offset[1],
+        }
+        for s in layers_spec
+    ]
+    context = {
+        "atom_style": atom_style,
+        "box_region": box_region,
+        "total_types": total_types,
+        "layers": layers_ctx,
+        "masses_block": masses_block,
+        "settings_path": str(settings_path),
+        "output_path": str(output_path),
+    }
+    env = Environment(
+        loader=PackageLoader("src.templates"), trim_blocks=True, lstrip_blocks=True
+    )
+    template = env.get_template("hetero/stack_hetero.lmp")
+    script_path = workdir / "stack_hetero.lmp"
+    script_path.write_text(template.render(context), encoding="utf-8")
+    _run_lammps(workdir, script_path)
+
+    if not output_path.exists():
+        raise RuntimeError(
+            f"assemble_hetero_stack: LAMMPS did not produce {output_path}."
+        )
+
+    return HeteroStack(
+        data_path=output_path,
+        settings_path=settings_path,
+        layers=layers_spec,
+        ri_offset=ri_offset,
+        reference_index=ref_index,
+        nonreference_index=nonref_index,
+        interface_spacing=float(interface_spacing) if interface_spacing is not None else 0.0,
+        stacking=stacking,
+        total_types=total_types,
+        material_offsets={m: material_anchor[m] for m in range(n_mats)},
     )
