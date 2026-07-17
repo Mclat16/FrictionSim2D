@@ -15,6 +15,7 @@ Covers:
 * Fail-loud behavior when no low-strain coincidence exists.
 """
 import re
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,11 +24,14 @@ from ase.io import read, write
 
 from src.builders import components
 from src.builders.hetero import (
+    _detect_atom_style,
+    _run_lammps,
     assemble_hetero_stack,
+    build_hetero_structure,
     build_matched_supercells,
     register_hetero_potentials,
 )
-from src.core.config import SheetConfig, load_settings
+from src.core.config import SheetConfig, SheetOnSheetSimulationConfig, load_settings
 from src.core.lattice_matching import find_coincidence_lattice
 
 MOS2_CIF = "examples/materials/h-MoS2.cif"
@@ -310,3 +314,108 @@ def test_hetero_stack_is_periodic_and_complete(tmp_path):
     assert np.linalg.norm(_wrap_vec_mod_cell(diff - offset, matched_box_2x2)) < 1e-2
     # (b) ...and that offset is genuinely non-zero -- NOT centroid-cancelled.
     assert np.linalg.norm(_wrap_vec_mod_cell(offset, matched_box_2x2)) > 0.5
+
+
+# =============================================================================
+# Task 6: end-to-end structure smoke -- build_hetero_structure -> real LAMMPS
+# =============================================================================
+
+
+def _two_material_config() -> SheetOnSheetSimulationConfig:
+    """A real 2-material (MoS2/WS2) SheetOnSheetSimulationConfig via the config path.
+
+    Mirrors the raw-dict [2D-1]/[2D-2] shape of
+    ``test_config.py::test_two_material_sections_fold_into_sheets_list`` but with
+    the REAL CIFs + SW potentials (so ``build_monolayer`` actually runs) and one
+    layer each. ``x``/``y`` are in ANGSTROMS; 4.0 Å is smaller than one
+    duplicated unit cell (~6.4 Å) for both materials, so ``build_monolayer``'s
+    target-size rounding keeps each supercell at the minimal single ortho cell
+    (6 atoms) -- the fastest structure that still exercises the full
+    match -> register -> assemble -> LAMMPS path. (30 Å, by contrast, rounds up
+    to a ~9x5 supercell of 270 atoms per material -- needlessly slow for a smoke
+    test whose point is structural self-consistency, not size.)
+    """
+    raw = {
+        "general": {"temp": 300, "scan_speed": 1, "hetero_stacking": "grouped"},
+        "2D-1": {"mat": "h-MoS2", "cif_path": MOS2_CIF, "pot_path": MOS2_POT,
+                 "pot_type": "sw", "x": 4.0, "y": 4.0, "layers": [1]},
+        "2D-2": {"mat": "h-WS2", "cif_path": WS2_CIF, "pot_path": WS2_POT,
+                 "pot_type": "sw", "x": 4.0, "y": 4.0, "layers": [1]},
+    }
+    return SheetOnSheetSimulationConfig(**raw, settings=load_settings())
+
+
+def _lammps_run0_energy(data_path, settings_path) -> float:
+    """Drive real LAMMPS on the produced files and return the ``run 0`` energy.
+
+    Emits a tiny self-contained script (``units metal``, ``atom_style`` detected
+    from the data file, ``boundary p p p``, ``read_data`` + ``include`` the real
+    settings, ``run 0``) and runs ``lmp_serial`` headless with ``cwd = workdir``
+    -- mandatory, because the settings' ``pair_coeff`` lines reference the staged
+    potentials by the run-dir-relative prefix ``provenance/potentials/...``. Both
+    ``data_path`` and ``settings_path`` are emitted as absolute paths so they
+    resolve independent of cwd. Asserts the log is free of "Lost atoms" (a lost
+    atom means the structure is not self-consistent / not genuinely periodic) and
+    returns the parsed potential energy.
+    """
+    data_path = Path(data_path).resolve()
+    settings_path = Path(settings_path).resolve()
+    workdir = data_path.parent  # hetero.data lives directly in the run dir
+    atom_style = _detect_atom_style(data_path)
+
+    script = f"""units           metal
+atom_style      {atom_style}
+boundary        p p p
+read_data       {data_path}
+include         {settings_path}
+run             0
+variable        pe equal pe
+variable        na equal atoms
+print           "RESULT_PE ${{pe}}"
+print           "RESULT_NATOMS ${{na}}"
+"""
+    script_path = workdir / "run0_smoke.lmp"
+    script_path.write_text(script, encoding="utf-8")
+    out = _run_lammps(workdir, script_path)
+
+    assert "Lost atoms" not in out, f"LAMMPS reported lost atoms:\n{out[-2000:]}"
+
+    energy = None
+    for line in out.splitlines():
+        if line.startswith("RESULT_PE"):
+            energy = float(line.split()[1])
+    assert energy is not None, f"could not parse RESULT_PE from LAMMPS:\n{out[-2000:]}"
+    return energy
+
+
+def test_end_to_end_structure_assembles_in_lammps(tmp_path):
+    """Capstone: the single ``build_hetero_structure`` entrypoint ties Tasks 3-5
+    together and yields a ``hetero.data`` + ``system.in.settings`` that assemble
+    in LAMMPS. A finite, physical ``run 0`` energy with no lost atoms proves the
+    structure + atom types + potentials are self-consistent and the box is
+    genuinely periodic (p p p).
+    """
+    cfg = _two_material_config()
+    settings = cfg.settings
+
+    stack = build_hetero_structure(cfg, settings, workdir=tmp_path)
+
+    # The entrypoint returns a ready stack pointing at real, existing files.
+    assert Path(stack.data_path).exists()
+    assert Path(stack.settings_path).exists()
+
+    at = read(str(stack.data_path), format="lammps-data")
+
+    # --- atom count == sum over placed layers of their source-supercell atoms ---
+    expected_total = sum(
+        len(read(str(layer.source), format="lammps-data")) for layer in stack.layers
+    )
+    assert len(at) == expected_total
+
+    # --- genuinely 3D-periodic box (all pbc, positive volume) -------------------
+    assert bool(np.all(at.pbc))
+    assert at.get_volume() > 0.0
+
+    # --- real LAMMPS run 0: finite, physical energy; no lost atoms (in helper) --
+    energy = _lammps_run0_energy(stack.data_path, stack.settings_path)
+    assert np.isfinite(energy) and abs(energy) < 1e6  # physical, not exploded (~1e9 = failure)

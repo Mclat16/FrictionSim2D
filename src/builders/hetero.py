@@ -48,7 +48,7 @@ from ase.data import atomic_masses, atomic_numbers, chemical_symbols
 from ase.io import read, write
 from jinja2 import Environment
 
-from ..core.config import GlobalSettings, SheetConfig
+from ..core.config import GlobalSettings, SheetConfig, SheetOnSheetSimulationConfig
 from ..core.lattice_matching import (
     MatchResult,
     _max_strain,
@@ -57,7 +57,7 @@ from ..core.lattice_matching import (
 )
 from ..core.potential_manager import PotentialManager
 from ..interfaces.jinja import PackageLoader
-from .components import calculate_layer_shifts
+from .components import build_monolayer, calculate_layer_shifts
 
 PathLike = Union[str, Path]
 
@@ -1001,3 +1001,92 @@ def assemble_hetero_stack(
         total_types=total_types,
         material_offsets={m: material_anchor[m] for m in range(n_mats)},
     )
+
+
+# =============================================================================
+# Top-level entrypoint: config -> ready heterostructure (Tasks 3-5 tied together)
+# =============================================================================
+
+
+def build_hetero_structure(
+    config: SheetOnSheetSimulationConfig,
+    settings: GlobalSettings,
+    workdir: PathLike,
+) -> HeteroStack:
+    """Build a ready heterostructure stack from a two-material config.
+
+    This is the single entrypoint a later sim builder calls to obtain a
+    self-consistent hetero stack (``hetero.data`` + ``system.in.settings``). It
+    ties the Phase-B structure-builder pieces together, in the order the pieces
+    require:
+
+    1. **Monolayers.** Build each material's orthogonalized monolayer with the
+       existing :func:`~src.builders.components.build_monolayer` (first return
+       value is the data-file path).
+    2. **Match (Task 3).** :func:`build_matched_supercells` finds the two
+       monolayers' coincidence lattice on their actual in-plane cells, tiles
+       each, and strains the smaller-area supercell onto the larger so both
+       output supercells share exactly one in-plane periodic box.
+    3. **Register potentials (Task 5).** :func:`register_hetero_potentials` is
+       geometry-independent, so it runs before assembly: it registers each
+       material as its own :class:`PotentialManager` component (disjoint,
+       contiguous atom-type blocks), writes ``system.in.settings``, and exposes
+       the per-material ``type_offsets`` assembly needs.
+    4. **Assemble (Task 4).** :func:`assemble_hetero_stack` stacks the two matched
+       supercells into one genuinely-periodic ``hetero.data`` -- applying the
+       cross-material RI offset one-sided, finding the interface z-spacing by
+       real minimization, and aligning atom types to the registered spine.
+
+    Scope: the **two-material** case (one interface) -- what the coincidence
+    match, the registry scan, and the single-interface assembler all handle. A
+    general N-material generalization is intentionally out of scope here.
+
+    Args:
+        config: Two-material sheet-on-sheet config. ``config.sheets`` supplies
+            the per-material :class:`SheetConfig` list (from the ``[2D-1]`` /
+            ``[2D-2]`` sections) and ``config.general.hetero_stacking`` the layer
+            ordering (``'grouped'`` | ``'alternating'``).
+        settings: Global simulation settings, threaded to every sub-step (in
+            practice the same object as ``config.settings``; the passed
+            ``settings`` is authoritative).
+        workdir: Run directory. All artefacts (per-material supercells,
+            ``lammps/system.in.settings``, staged ``provenance/potentials``, and
+            the final ``hetero.data``) are written under it.
+
+    Returns:
+        The assembled :class:`HeteroStack`; ``.data_path`` and ``.settings_path``
+        are the ready heterostructure structure + potentials.
+
+    Raises:
+        ValueError: If fewer than two materials are configured (a
+            heterostructure needs an interface between two materials).
+    """
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    sheets: List[SheetConfig] = list(config.sheets)
+    if len(sheets) < 2:
+        raise ValueError(
+            f"build_hetero_structure needs >= 2 materials (a heterostructure "
+            f"interface); config.sheets has {len(sheets)}."
+        )
+
+    # 1. Monolayer per material (build_monolayer returns the path as element 0).
+    mono_paths = [Path(build_monolayer(sheet)[0]) for sheet in sheets]
+
+    # 2. Match + strain smaller onto larger -> two supercells, one shared box.
+    matched = build_matched_supercells(mono_paths[0], mono_paths[1], workdir)
+
+    # 3. Register the materials' potential/type spine (geometry-independent).
+    hetero_potentials = register_hetero_potentials(sheets, settings, workdir)
+
+    # 4. Assemble into one periodic hetero.data aligned to that spine.
+    stack = assemble_hetero_stack(
+        matched,
+        sheets,
+        hetero_potentials,
+        config.general.hetero_stacking,
+        settings,
+        workdir,
+    )
+    return stack
