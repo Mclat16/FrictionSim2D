@@ -65,6 +65,17 @@ let the multivariate `+pes_scan` rung arbitrate. See
 campaign with `[2D] layers = [2]` (e.g. `examples/pes_tip_config.ini` with
 `layers = [2]`); descriptors extract identically (the `L2/` run dir is handled).
 
+### Freestanding tip scan (substrate-free)
+
+Omitting the `[sub]` section from a `pes-tip` config selects the **freestanding**
+builder: a self-supported N-layer slab of the material itself (`[2D] layers = [4]`,
+`layer_1` held fixed, upper layers relaxed) replaces the amorphous substrate,
+removing the disordered sheet-substrate registry that otherwise contributes
+82-99% of the tip-PES energy noise. Each grid point is evaluated by a static
+`minimize` (`[pes] eval_mode = minimize`, cheapest) or a short finite-T MD run
+with the `layer_2` Langevin band (`eval_mode = md`, a thermalized PES). Descriptor
+extraction is unchanged. Example: `examples/afm_freestanding_pes_config.ini`.
+
 Both write the scan as the production-run script `lammps/slide.in`, so the
 existing HPC array/combined job generation applies unchanged. Each grid point
 uses a **force-converged** minimization (`minimize 0.0 1e-6 …`); the sliding
