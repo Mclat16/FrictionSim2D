@@ -404,3 +404,28 @@ def test_afm_explicit_tip_y_ignores_tip_y_offset(tmp_path: Path) -> None:
     system_script = (layer_dir / "system.in").read_text(encoding="utf-8")
 
     assert " 41.0 " in system_script
+
+
+def _freestanding_afm_cfg(tmp_path, layers=(4,)):
+    from src.core.config import AFMSimulationConfig, load_settings
+    pot = tmp_path / "d.sw"; pot.write_text("# pot", encoding="utf-8")
+    cif = tmp_path / "d.cif"; cif.write_text("# cif", encoding="utf-8")
+    return AFMSimulationConfig(**{
+        "general": {"temp": 300.0, "force": [2.0], "scan_speed": 2.0, "finite_sheet": False},
+        "2D": {"mat": "h-MoS2", "pot_type": "sw", "pot_path": str(pot),
+               "cif_path": str(cif), "x": 40.0, "y": 40.0, "layers": list(layers)},
+        "tip": {"mat": "Si", "pot_type": "sw", "pot_path": str(pot),
+                "cif_path": str(cif), "r": 25.0, "amorph": "c"},
+        "pes": {"grid_n": 8},
+        "settings": load_settings().model_dump(),
+    })
+
+
+def test_provenance_skips_absent_substrate(tmp_path):
+    from src.builders.afm import AFMSimulation
+    cfg = _freestanding_afm_cfg(tmp_path)
+    builder = AFMSimulation(cfg, output_dir=str(tmp_path / "o"))
+    # _init_provenance must not attempt to read a None substrate config, and it
+    # must still create the provenance folder for the present components.
+    builder._init_provenance()  # must not raise on a None substrate
+    assert (builder.output_dir / "provenance").is_dir()

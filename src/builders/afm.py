@@ -126,8 +126,9 @@ class AFMSimulation(SimulationBase):
         provenance_components = [
             ('sheet', self.config.sheet),
             ('tip', self.config.tip),
-            ('sub', self.config.sub),
         ]
+        if self.config.sub is not None:
+            provenance_components.append(('sub', self.config.sub))
         if self.config.flake is not None:
             provenance_components.append(('flake', self.config.flake))
         for component_name, config in provenance_components:
@@ -154,15 +155,17 @@ class AFMSimulation(SimulationBase):
             )
             logger.info("Built flake: %s", self.flake_path.name)
 
-        sub_path = components.build_substrate(
-            self.config.sub,
-            build_dir,
-            self.sheet_dims,
-            settings=self.config.settings,
-            target_x=self.config.sub.x if self.config.general.finite_sheet else None,
-            target_y=self.config.sub.y if self.config.general.finite_sheet else None,
-        )
-        logger.info("Built substrate: %s", sub_path.name)
+        sub_path = None
+        if self.config.sub is not None:
+            sub_path = components.build_substrate(
+                self.config.sub,
+                build_dir,
+                self.sheet_dims,
+                settings=self.config.settings,
+                target_x=self.config.sub.x if self.config.general.finite_sheet else None,
+                target_y=self.config.sub.y if self.config.general.finite_sheet else None,
+            )
+            logger.info("Built substrate: %s", sub_path.name)
 
         if self.config.settings.thermostat.type == 'langevin':
             tip_height = tip_radius / self.config.settings.geometry.tip_reduction_factor
@@ -176,23 +179,30 @@ class AFMSimulation(SimulationBase):
             )
             logger.info("Applied Langevin regions to tip")
 
-            components.apply_langevin_regions(
-                component_name='sub',
-                component_path=sub_path,
-                config=self.config.sub,
-                settings=self.config.settings,
-                component_height=self.config.sub.thickness,
-                substrate_thickness=self.config.sub.thickness
-            )
-            logger.info("Applied Langevin regions to substrate")
+            if self.config.sub is not None:
+                components.apply_langevin_regions(
+                    component_name='sub',
+                    component_path=sub_path,
+                    config=self.config.sub,
+                    settings=self.config.settings,
+                    component_height=self.config.sub.thickness,
+                    substrate_thickness=self.config.sub.thickness
+                )
+                logger.info("Applied Langevin regions to substrate")
 
         return tip_path, tip_radius, sub_path
 
     def _get_substrate_box_dims(self) -> Dict[str, float]:
-        """Return substrate box dimensions from the generated substrate data file."""
+        """Box dimensions: from the substrate .lmp, or from the sheet when freestanding."""
+        if self.config.sub is None:
+            sd = self.sheet_dims
+            return {
+                'xlo': float(sd['xlo']), 'xhi': float(sd['xhi']),
+                'ylo': float(sd['ylo']), 'yhi': float(sd['yhi']),
+                'zlo': 0.0, 'zhi': 0.0,
+            }
         dims = get_model_dimensions(self.sub_path)
         required = ['xlo', 'xhi', 'ylo', 'yhi', 'zlo', 'zhi']
-        
         return {key: float(dims[key]) for key in required}
 
     def _validate_final_substrate_dims(self) -> None:
@@ -254,13 +264,17 @@ class AFMSimulation(SimulationBase):
         pm = self.pm[n_layers]
         lat_c = self.lat_c
 
-        gap_sub_sheet = pm.calculate_gap('sub', 'sheet', buffer=0.5)
-
-        sub_thickness = self.config.sub.thickness
-
         self.z_positions[n_layers] = {}
-        self.z_positions[n_layers]['sub'] = 0.0
-        sheet_base_z = sub_thickness + gap_sub_sheet
+        if self.config.sub is None:
+            # Freestanding: bottom sheet layer sits at a small vacuum pad; no substrate.
+            gap_sub_sheet = 0.0
+            self.z_positions[n_layers]['sub'] = 0.0
+            sheet_base_z = 5.0
+        else:
+            gap_sub_sheet = pm.calculate_gap('sub', 'sheet', buffer=0.5)
+            sub_thickness = self.config.sub.thickness
+            self.z_positions[n_layers]['sub'] = 0.0
+            sheet_base_z = sub_thickness + gap_sub_sheet
         self.z_positions[n_layers]['sheet'] = sheet_base_z
 
         lat_c = (self.config.sheet.lat_c or 6.0) if lat_c is None else lat_c
@@ -322,7 +336,8 @@ class AFMSimulation(SimulationBase):
         )
         pm.set_lj_overrides(self.config.lj_override)
 
-        pm.register_component('sub', self.config.sub)
+        if self.config.sub is not None:
+            pm.register_component('sub', self.config.sub)
         pm.register_component('tip', self.config.tip)
 
         sheet_needs_layer_types = (
@@ -347,17 +362,20 @@ class AFMSimulation(SimulationBase):
         if self.config.settings.simulation.drive_method == 'virtual_atom':
             pm.register_virtual_atom()
 
-        pm.add_self_interaction('sub')
+        if self.config.sub is not None:
+            pm.add_self_interaction('sub')
         pm.add_self_interaction('tip')
         pm.add_self_interaction('sheet')
 
-        pm.add_cross_interaction('sub', 'tip')
-        pm.add_cross_interaction('sub', 'sheet')
+        if self.config.sub is not None:
+            pm.add_cross_interaction('sub', 'tip')
+            pm.add_cross_interaction('sub', 'sheet')
         pm.add_cross_interaction('tip', 'sheet')
 
         if has_flake:
             pm.add_self_interaction('flake')
-            pm.add_cross_interaction('sub', 'flake')
+            if self.config.sub is not None:
+                pm.add_cross_interaction('sub', 'flake')
             pm.add_cross_interaction('tip', 'flake')
             pm.add_cross_interaction('sheet', 'flake')
 
@@ -368,7 +386,8 @@ class AFMSimulation(SimulationBase):
         pm.write_file(settings_path)
 
         self.groups[n_sheet_layers] = {}
-        self.groups[n_sheet_layers]['sub_types'] = pm.types.get_group_string('sub')
+        if self.config.sub is not None:
+            self.groups[n_sheet_layers]['sub_types'] = pm.types.get_group_string('sub')
         self.groups[n_sheet_layers]['tip_types'] = pm.types.get_group_string('tip')
         self.groups[n_sheet_layers]['sheet_types'] = pm.types.get_group_string('sheet')
 
@@ -416,7 +435,8 @@ class AFMSimulation(SimulationBase):
         uses_reaxff = (
             normalize_potential_type(self.config.sheet.pot_type) in reaxff_types or
             normalize_potential_type(self.config.tip.pot_type) in reaxff_types or
-            normalize_potential_type(self.config.sub.pot_type) in reaxff_types
+            (self.config.sub is not None and
+             normalize_potential_type(self.config.sub.pot_type) in reaxff_types)
         )
         atom_style = 'charge' if uses_reaxff else 'atomic'
 
@@ -440,7 +460,7 @@ class AFMSimulation(SimulationBase):
             tip_y = default_tip_y + float(self.config.tip.tip_y_offset)
         tip_z = z_positions['tip']
 
-        sub_natypes = len(groups['sub_types'].split())
+        sub_natypes = len(groups['sub_types'].split()) if 'sub_types' in groups else 0
         tip_natypes = len(groups['tip_types'].split())
         offset_2d = sub_natypes + tip_natypes
 
@@ -489,10 +509,10 @@ class AFMSimulation(SimulationBase):
             'yhi': yhi,
             'zhi_box': zhi_box,
             'potential_file': f"{self.relative_run_dir_layer[n_layers]}/lammps/system.in.settings",
-            'sub_file': f"{self.relative_run_dir}/build/{sub_path.name}",
+            'sub_file': f"{self.relative_run_dir}/build/{sub_path.name}" if sub_path is not None else None,
             'tip_file': f"{self.relative_run_dir}/build/{tip_path.name}",
             'sheet_file': f"{self.relative_run_dir}/build/{sheet_path.name}",
-            'path_sub': f"{self.relative_run_dir}/build/{sub_path.name}",
+            'path_sub': f"{self.relative_run_dir}/build/{sub_path.name}" if sub_path is not None else None,
             'path_tip': f"{self.relative_run_dir}/build/{tip_path.name}",
             'path_sheet': f"{self.relative_run_dir}/build/{sheet_path.name}",
             'tip_x': tip_x,
@@ -511,7 +531,7 @@ class AFMSimulation(SimulationBase):
             'z_sub': z_positions['sub'],
             'z_sheet': z_positions['sheet'],
             'z_tip': z_positions['tip'],
-            'sub_types': groups['sub_types'],
+            'sub_types': groups.get('sub_types', ''),
             'tip_types': groups['tip_types'],
             'sheet_types': groups['sheet_types'],
             'ngroups': total_types,
