@@ -12,6 +12,24 @@ from .lattice_matching import _max_strain
 _TILT_EPS = 1e-9
 
 
+def canonicalize_cell_to_lammps(cell_2x2: np.ndarray) -> tuple[np.ndarray, float]:
+    """Rotate a 2x2 in-plane cell so a1 lies along +x (LAMMPS-canonical form).
+
+    Returns (canonical_cell, rotation_deg). Pure rotation: lengths and the
+    a1-a2 angle are preserved; only the frame is rotated so a1=(|a1|,0) and
+    a2=(a2.a1hat, |a2 x a1hat|) with the a2 y-component made positive.
+    """
+    a1 = np.asarray(cell_2x2[0], float); a2 = np.asarray(cell_2x2[1], float)
+    theta = np.arctan2(a1[1], a1[0])
+    c, s = np.cos(-theta), np.sin(-theta)
+    R = np.array([[c, -s], [s, c]])
+    b1 = R @ a1; b2 = R @ a2
+    if b2[1] < 0:                      # keep ly > 0 (right-handed, LAMMPS-valid)
+        b2 = np.array([b2[0], -b2[1]])
+    canon = np.array([[b1[0], 0.0], [b2[0], b2[1]]])
+    return canon, np.degrees(-theta)
+
+
 def _create_lammps_instance():
     """Start a headless LAMMPS instance.
 
