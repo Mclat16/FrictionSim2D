@@ -1,0 +1,76 @@
+# Freestanding tip-on-slab surface PES scan (self-contained, no substrate).
+# A self-supported N-layer slab of the sheet material: layer_1 is held fixed
+# (the anchor that removes amorphous-substrate noise), the upper layers relax.
+# The rigid tip is placed at a load-calibrated contact gap and grid-scanned
+# laterally; total energy and the lateral force on the tip are recorded.
+
+clear
+units           metal
+atom_style      {{ atom_style }}
+boundary        p p p
+
+neighbor        {{ neighbor_list }} bin
+{{ neigh_modify_command }}
+comm_style      tiled
+thermo          {{ thermo }}
+timestep        {{ timestep }}
+
+region          box block {{ xlo }} {{ xhi }} {{ ylo }} {{ yhi }} -5 {{ zhi_box }}
+create_box      {{ ngroups }} box
+read_data       {{ tip_file }} add append shift {{ tip_x }} {{ tip_y }} {{ tip_z }} group tip offset 0 0 0 0 0
+read_data       {{ sheet_file }} add append shift {{ sheet_shift_x }} {{ sheet_shift_y }} {{ sheet_z }} group 2D offset {{ offset_2d }} 0 0 0 0
+include         {{ potential_file }}
+balance         1.0 rcb
+
+min_style       {{ min_style }}
+
+# layer_1 (bottom slab layer) is the fixed anchor; tip is held rigid throughout.
+fix             slab_anchor layer_1 setforce 0.0 0.0 0.0
+fix             tip_hold tip_all setforce 0.0 0.0 0.0
+
+# --- 1) settle the slab with the tip held clear ----------------------------------
+compute         cz_tip tip_all reduce min z
+compute         cz_sheet 2D_all reduce max z
+thermo_style    custom step pe c_cz_tip c_cz_sheet
+{{ minimization_command }}
+run             0
+
+# --- 2) place the rigid tip at the contact gap above the slab --------------------
+variable        approach equal (c_cz_tip-c_cz_sheet)-{{ contact_gap }}
+displace_atoms  tip_all move 0.0 0.0 $(-v_approach) units box
+{{ minimization_command }}
+
+# --- 3) force the surface exerts on the (rigid, held) tip ------------------------
+variable        fx equal f_tip_hold[1]*{{ ev_a_to_nn }}
+variable        fy equal f_tip_hold[2]*{{ ev_a_to_nn }}
+variable        fz equal f_tip_hold[3]*{{ ev_a_to_nn }}
+
+# --- lateral scan grid over one surface unit cell --------------------------------
+variable        Nx     equal {{ grid_n }}
+variable        Ny     equal {{ grid_n }}
+variable        Lx     equal {{ period_x }}
+variable        Ly     equal {{ period_y }}
+variable        dxstep equal v_Lx/v_Nx
+variable        dystep equal v_Ly/v_Ny
+
+print           "x,y,energy_eV,fx,fy,fz" file {{ results_csv }} screen no
+
+variable        prev_dx equal 0.0
+variable        prev_dy equal 0.0
+
+variable        ix loop ${Nx}
+label           loop_ix
+variable        iy loop ${Ny}
+label           loop_iy
+variable        dx equal (v_ix-1)*v_dxstep
+variable        dy equal (v_iy-1)*v_dystep
+displace_atoms  tip_all move $(v_dx-v_prev_dx) $(v_dy-v_prev_dy) 0.0 units box
+variable        prev_dx equal $(v_dx)
+variable        prev_dy equal $(v_dy)
+{{ minimization_command }}
+variable        pe_now equal pe
+print           "$(v_dx),$(v_dy),$(v_pe_now),$(v_fx),$(v_fy),$(v_fz)" append {{ results_csv }} screen no
+next            iy
+jump            SELF loop_iy
+next            ix
+jump            SELF loop_ix
