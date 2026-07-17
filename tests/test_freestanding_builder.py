@@ -1,6 +1,8 @@
 """Tests for the freestanding (substrate-free) tip PES builder."""
 from pathlib import Path
 
+import pytest
+
 from src.builders.afm_freestanding import FreestandingPESTipSimulation
 from src.core.config import AFMSimulationConfig, load_settings
 
@@ -54,3 +56,9 @@ def test_freestanding_pes_template_fixes_layer1_no_substrate(tmp_path, monkeypat
     assert "fix             slab_anchor layer_1 setforce 0.0 0.0 0.0" in slide
     assert "x,y,energy_eV,fx,fy,fz" in slide                      # descriptor columns
     assert "Nx     equal 8" in slide
+
+
+def test_freestanding_pes_requires_two_layers(tmp_path):
+    builder = FreestandingPESTipSimulation(_free_cfg(tmp_path, layers=(1,)), output_dir=str(tmp_path / "o"))
+    with pytest.raises(ValueError, match="layers"):
+        builder.write_inputs(1)
