@@ -1,9 +1,18 @@
 """D1 hetero sheet-on-sheet slide assembly (consumes hetero.py's structure builder)."""
-from typing import List, Dict
+import logging
+from typing import List, Dict, Optional
+
+import numpy as np
 from ase.io import read
 from jinja2 import Environment
 
+from ..core.config import SheetOnSheetSimulationConfig
+from ..core.simulation_base import SimulationBase
+from ..data.models import EV_A_TO_NN, EV_A3_TO_GPA, NM_TO_EV_A2
 from ..interfaces.jinja import PackageLoader
+from .hetero import _detect_atom_style, build_hetero_structure
+
+logger = logging.getLogger(__name__)
 
 PAD = 1.0  # Å pad above/below each layer's atom z-range
 
@@ -81,3 +90,174 @@ def compute_layer_zbands(data_path, layers) -> List[Dict]:
                 f"semantics or PAD={PAD}."
             )
     return bands
+
+
+class HeteroSheetOnSheetSimulation(SimulationBase):
+    """Builder for a periodic heterostructure sheet-on-sheet slide.
+
+    Turns a two-material :class:`SheetOnSheetSimulationConfig` into a runnable
+    periodic hetero slide by combining the Phase-B structure builder
+    (:func:`~src.builders.hetero.build_hetero_structure`, which assembles
+    ``hetero.data`` + ``lammps/system.in.settings`` and stages the potentials)
+    with the D1 slide template (``templates/hetero/slide.lmp``).
+
+    The assembled N-layer stack (N = sum of each material's layer count, >= 4)
+    is a fixed bottom / thermostatted middle / driven top slide, exactly like the
+    homogeneous :class:`~src.builders.sheetonsheet.SheetOnSheetSimulation`, but
+    the layer groups are defined by z-slab region (hetero layers share atom
+    types, so type-based groups are impossible) and the interlayer friction is
+    read from the bottom-layer reaction force (many-body ``sw`` hybrid, no
+    ``compute group/group``).
+
+    Path convention (diverges from the homogeneous builder, intentional for D1):
+    every path in the render context is RUN-DIR-RELATIVE (``hetero.data``,
+    ``lammps/system.in.settings``, ``results/...``, ``visuals/...``). The stack
+    is built directly into ``output_dir`` so the potential settings' run-dir-
+    relative ``provenance/potentials/...`` prefix lines up when LAMMPS is run
+    with ``cwd = output_dir`` (Task 5's e2e).
+    """
+
+    #: A dynamic hetero slide needs a fixed bottom, a thermostatted middle and a
+    #: driven top across TWO materials -> at least 2 + 2 layers.
+    MIN_LAYERS: int = 4
+
+    def __init__(self, config: SheetOnSheetSimulationConfig, output_dir: str,
+                 config_path: Optional[str] = None):
+        super().__init__(config, output_dir, config_path=config_path)
+        self.config: SheetOnSheetSimulationConfig = config
+
+    @property
+    def n_layers(self) -> int:
+        """Total layer count = sum of each material's single layer count.
+
+        Each material's ``layers`` is a single-element list (e.g. ``[2]``); a
+        2+2 stack is 4 layers. Mirrors
+        :attr:`SheetOnSheetSimulation.n_layers`' single-count requirement.
+        """
+        for sheet in self.config.sheets:
+            if len(sheet.layers) != 1:
+                raise ValueError(
+                    "Hetero sheet-on-sheet currently requires exactly one value "
+                    "in each material's 2D.layers (e.g., layers=[2])."
+                )
+        return sum(int(sheet.layers[0]) for sheet in self.config.sheets)
+
+    def _init_provenance(self) -> None:
+        """Create the provenance folder and record each material's input files.
+
+        :class:`SimulationBase` has no ``_init_provenance`` (only
+        :class:`SheetOnSheetSimulation` does, and that one is single-material),
+        so the hetero builder provides its own: one provenance component per
+        stacked material. ``build_hetero_structure`` separately stages the real
+        potential files under ``provenance/potentials/`` for the run itself.
+        """
+        prov_dir = self.output_dir / "provenance"
+        prov_dir.mkdir(parents=True, exist_ok=True)
+        for i, sheet in enumerate(self.config.sheets):
+            self._add_component_files_to_provenance(f"sheet_{i + 1}", sheet)
+
+    def build(self) -> None:
+        """Assemble the hetero stack and write ``lammps/slide.in``."""
+        n = self.n_layers
+        if n < self.MIN_LAYERS:
+            raise ValueError(
+                f"Hetero sheet-on-sheet requires at least {self.MIN_LAYERS} "
+                f"layers, got {n}"
+            )
+
+        logger.info("Building %d-layer heterostructure sheet-on-sheet slide...", n)
+        self._create_directories()
+        self._init_provenance()
+
+        # Build the stack INTO the run dir so the potential settings' run-dir-
+        # relative prefix (provenance/potentials/...) resolves when LAMMPS runs
+        # from output_dir (Task 5). This writes output_dir/hetero.data,
+        # output_dir/lammps/system.in.settings and output_dir/provenance/.
+        stack = build_hetero_structure(
+            self.config, self.config.settings, workdir=self.output_dir
+        )
+
+        bands = compute_layer_zbands(stack.data_path, stack.layers)
+
+        # Box from the assembled hetero.data (template adds the z-vacuum itself
+        # via change_box, so zhi is just the topmost atom z).
+        at = read(str(stack.data_path), format="lammps-data")
+        cell = np.array(at.cell)
+        xlo, xhi = 0.0, float(cell[0, 0])
+        ylo, yhi = 0.0, float(cell[1, 1])
+        zhi = float(at.get_positions()[:, 2].max())
+
+        settings = self.config.settings
+        sim = settings.simulation
+        out = settings.output
+        general = self.config.general
+
+        atom_style = _detect_atom_style(stack.data_path)  # 'atomic' for sw
+        lat_c = stack.interface_spacing or settings.geometry.lat_c_default
+
+        # Same key set as SheetOnSheetSimulation.write_inputs' base_context (only
+        # the keys the template actually references), with hetero-specific values
+        # and RUN-DIR-RELATIVE paths.
+        context = {
+            "temp": general.temp,
+            "xlo": xlo,
+            "xhi": xhi,
+            "ylo": ylo,
+            "yhi": yhi,
+            "zhi": zhi,
+            "data_file": "hetero.data",
+            "potential_file": "lammps/system.in.settings",
+            "num_atom_types": stack.total_types,
+            "ngroups": stack.total_types,
+            "n_layers": n,
+            "constraint_mode": "none",
+            "n_bond_types": 0,
+            "atom_style": atom_style,
+            "pot_type": "sw",
+            "has_internal_lj": True,  # hybrid sw -> reaction-force friction proxy
+            "pressures": general.pressure,
+            "scan_speed_config": general.scan_speed,
+            "scan_angle_config": general.scan_angle,
+            "scan_angle_force": general.scan_angle_force,
+            "drive_method": sim.drive_method,
+            "thermostat_type": settings.thermostat.type,
+            "timestep": sim.timestep,
+            "thermo": sim.thermo,
+            "neighbor_list": sim.neighbor_list,
+            "neigh_modify_command": sim.neigh_modify_command,
+            "run_steps": sim.slide_run_steps,
+            "min_style": sim.min_style,
+            "minimization_command": sim.minimization_command,
+            "results_freq": out.results_frequency,
+            "dump_freq": out.dump_frequency.get("slide", 1000),
+            "dump_enabled": out.dump.get("slide", False),
+            "results_file_pattern": (
+                "results/friction_p${pressure}_a${a}_s${speed}"
+            ),
+            "dump_file_pattern": (
+                "visuals/slide_p${pressure}_a${a}_s${speed}.lammpstrj"
+            ),
+            "driving_spring_ev": (general.driving_spring or 50.0) / NM_TO_EV_A2,
+            "bond_spring_ev": (general.bond_spring or 80.0) / NM_TO_EV_A2,
+            "lat_c": lat_c,
+            "ev_a_to_nn": EV_A_TO_NN,
+            "ev_a3_to_gpa": EV_A3_TO_GPA,
+            "layers": bands,
+        }
+
+        script = self.render_template("hetero/slide.lmp", context)
+        self.write_file("lammps/slide.in", script)
+        logger.info("Wrote hetero slide script to %s/lammps/slide.in", self.output_dir)
+
+        # Reuse the homogeneous HPC scaffolding, but do NOT let it block the
+        # slide.in write. It also assumes the sim-root-relative path convention;
+        # the hetero slide is run-dir-relative, so any script it emits needs a
+        # path-convention follow-up (Task 5) rather than being forced here.
+        try:
+            self._generate_hpc_scripts()
+        except Exception as exc:  # pragma: no cover - defensive, non-fatal
+            logger.warning(
+                "HPC script generation skipped for hetero slide (%s). The "
+                "homogeneous HPC path assumes sim-root-relative paths while the "
+                "hetero slide is run-dir-relative; deferring to Task 5.", exc,
+            )

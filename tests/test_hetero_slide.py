@@ -1,12 +1,18 @@
 """Tests for D1 hetero sheet-on-sheet slide assembly helpers."""
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from ase import Atoms
 from ase.io import read, write
 from src.core.config import SheetOnSheetSimulationConfig, load_settings
 from src.builders.hetero import build_hetero_structure
-from src.builders.hetero_slide import compute_layer_zbands, render_hetero_slide
+from src.builders.hetero_slide import (
+    HeteroSheetOnSheetSimulation,
+    compute_layer_zbands,
+    render_hetero_slide,
+)
 
 MAT, POT = "examples/materials", "examples/potentials/sw"
 
@@ -18,6 +24,17 @@ def _hetero_2p2_config():
                  "pot_type": "sw", "x": 12.0, "y": 12.0, "layers": [2]},
         "2D-2": {"mat": "h-WS2", "cif_path": f"{MAT}/h-WS2.cif", "pot_path": f"{POT}/sw_lammps/t-WS2.sw",
                  "pot_type": "sw", "x": 12.0, "y": 12.0, "layers": [2]},
+    }
+    return SheetOnSheetSimulationConfig(**raw, settings=load_settings())
+
+
+def _hetero_1p1_config():
+    raw = {  # 1+1 = 2 layers -> below MIN_LAYERS
+        "general": {"temp": 300, "scan_speed": 1, "hetero_stacking": "grouped"},
+        "2D-1": {"mat": "h-MoS2", "cif_path": f"{MAT}/h-MoS2.cif", "pot_path": f"{POT}/MoS2_wen.sw",
+                 "pot_type": "sw", "x": 12.0, "y": 12.0, "layers": [1]},
+        "2D-2": {"mat": "h-WS2", "cif_path": f"{MAT}/h-WS2.cif", "pot_path": f"{POT}/sw_lammps/t-WS2.sw",
+                 "pot_type": "sw", "x": 12.0, "y": 12.0, "layers": [1]},
     }
     return SheetOnSheetSimulationConfig(**raw, settings=load_settings())
 
@@ -192,3 +209,23 @@ def test_hetero_slide_defines_layer_groups_by_region():
     # is reused verbatim.
     assert "center" in script and "fix" in script
     assert "aveforce" in script
+
+
+def test_builder_requires_four_layers(tmp_path):
+    cfg = _hetero_1p1_config()  # 1+1 = 2 layers -> below MIN_LAYERS
+    sim = HeteroSheetOnSheetSimulation(cfg, str(tmp_path))
+    with pytest.raises(ValueError, match=r"[Aa]t least 4"):
+        sim.build()
+
+
+def test_builder_writes_slide_in_referencing_hetero_stack(tmp_path):
+    cfg = _hetero_2p2_config()
+    sim = HeteroSheetOnSheetSimulation(cfg, str(tmp_path))
+    sim.build()
+
+    slide = next(Path(tmp_path).rglob("slide*.in"))
+    text = slide.read_text()
+    assert "hetero.data" in text                       # sources the assembled stack
+    assert "system.in.settings" in text
+    assert "group           layer_1 region" in text or "layer_1 region" in text
+    assert "read_data" in text and text.count("read_data") == 1
