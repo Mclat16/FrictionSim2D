@@ -302,6 +302,13 @@ def test_afm_config_sub_optional(tmp_path):
     assert cfg.sub is None
 
 
+def test_afm_config_finite_sheet_requires_substrate(tmp_path):
+    # Finite-sheet mode inherently needs a substrate to rest on; omitting [sub]
+    # must fail loudly and clearly, not with a downstream substrate-sizing error.
+    with pytest.raises(ValueError, match="finite sheet must rest on a substrate"):
+        AFMSimulationConfig(**_afm_dict(tmp_path, include_sub=False, finite_sheet=True))
+
+
 def test_afm_config_freestanding_skips_amorph_requirement(tmp_path):
     # The amorphous-substrate requirement is skipped specifically because the
     # substrate is ABSENT (sub is None), not blanket-removed: a no-[sub] config

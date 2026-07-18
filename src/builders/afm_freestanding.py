@@ -35,8 +35,9 @@ class FreestandingPESTipSimulation(PESTipSimulation):
         load = getattr(pes, 'tip_load', None) if pes is not None else None
         logger.info(
             "Resolved: freestanding tip PES | %d-layer slab | no substrate | "
-            "eval_mode=%s | target load=%s nN",
-            n_layers, self._eval_mode(), load,
+            "eval_mode=%s | contact gap=%.2f Angstrom (fixed; tip_load=%s nN is the "
+            "external gap-calibration target, not enforced by this script)",
+            n_layers, self._eval_mode(), PES_TIP_CONTACT_GAP, load,
         )
 
     def write_inputs(self, n_layers: int) -> None:

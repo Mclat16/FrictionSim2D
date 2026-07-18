@@ -592,7 +592,11 @@ class AFMSimulationConfig(BaseModel):
             return self
 
         if self.sub is None:
-            return self
+            raise ValueError(
+                "Finite-sheet AFM requires a [sub] section: a finite sheet must rest "
+                "on a substrate. For a substrate-free scan, use the freestanding tip "
+                "PES (omit [sub]) with finite_sheet = false."
+            )
 
         if self.sub.x is None or self.sub.y is None:
             raise ValueError(

@@ -97,4 +97,8 @@ def test_freestanding_logs_resolved_config(tmp_path, caplog):
     builder = FreestandingPESTipSimulation(_free_cfg(tmp_path, layers=(4,)), output_dir=str(tmp_path / "o"))
     with caplog.at_level(logging.INFO):
         builder._log_resolved_config(4)
-    assert any("freestanding" in r.message.lower() and "4-layer" in r.message for r in caplog.records)
+    assert any(
+        "freestanding" in r.message.lower() and "4-layer" in r.message
+        and "contact gap" in r.message and "not enforced" in r.message
+        for r in caplog.records
+    )
