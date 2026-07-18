@@ -22,6 +22,7 @@ from .path_utils import format_dimension_token
 from ..builders.afm import AFMSimulation
 from ..builders.afm_freestanding import FreestandingPESTipSimulation
 from ..builders.sheetonsheet import SheetOnSheetSimulation
+from ..builders.hetero_slide import HeteroSheetOnSheetSimulation
 from ..builders.pes_scan import PESSheetSimulation, PESTipSimulation
 from ..builders.indent import IndentSimulation
 from ..hpc import HPCScriptGenerator, HPCConfig
@@ -364,6 +365,16 @@ def _select_afm_builder_cls(model, config_obj):
     return default_cls
 
 
+def _select_sheet_builder_cls(model, config_obj):
+    """Route sheet-on-sheet to the hetero builder when >=2 materials are configured."""
+    if model == 'pes_sheet':
+        return PESSheetSimulation
+    sheets = getattr(config_obj, 'sheets', None) or []
+    if len(sheets) >= 2:
+        return HeteroSheetOnSheetSimulation
+    return SheetOnSheetSimulation
+
+
 def run_simulations(
     config_file: str,
     model: str,
@@ -462,7 +473,7 @@ def run_simulations(
                 config_obj = SheetOnSheetSimulationConfig(**run_dict)
                 config_json_path = prov_dir / 'config.json'
                 config_json_path.write_text(config_obj.model_dump_json(indent=2), encoding='utf-8')
-                builder_cls = PESSheetSimulation if model == 'pes_sheet' else SheetOnSheetSimulation
+                builder_cls = _select_sheet_builder_cls(model, config_obj)
                 builder = builder_cls(config_obj, output_dir, config_path=str(config_json_path))
 
             builder.set_base_output_dir(simulation_root)

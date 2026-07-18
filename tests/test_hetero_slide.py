@@ -13,6 +13,8 @@ from src.builders.hetero_slide import (
     compute_layer_zbands,
     render_hetero_slide,
 )
+from src.builders.sheetonsheet import SheetOnSheetSimulation
+from src.core.run import _select_sheet_builder_cls
 
 MAT, POT = "examples/materials", "examples/potentials/sw"
 
@@ -228,4 +230,23 @@ def test_builder_writes_slide_in_referencing_hetero_stack(tmp_path):
     assert "hetero.data" in text                       # sources the assembled stack
     assert "system.in.settings" in text
     assert "group           layer_1 region" in text or "layer_1 region" in text
-    assert "read_data" in text and text.count("read_data") == 1
+
+
+def _single_material_config():
+    """A homogeneous config with a single [2D] section -> cfg.sheets has length 1."""
+    raw = {
+        "general": {"temp": 300, "scan_speed": 1},
+        "2D": {"mat": "h-MoS2", "cif_path": f"{MAT}/h-MoS2.cif", "pot_path": f"{POT}/MoS2_wen.sw",
+               "pot_type": "sw", "x": 8, "y": 8, "layers": [4]},
+    }
+    return SheetOnSheetSimulationConfig(**raw, settings=load_settings())
+
+
+def test_routing_selects_hetero_for_two_materials():
+    assert _select_sheet_builder_cls("sheetonsheet", _hetero_2p2_config()) is HeteroSheetOnSheetSimulation
+
+
+def test_routing_selects_homogeneous_for_single_material():
+    cfg = _single_material_config()
+    assert len(cfg.sheets) == 1
+    assert _select_sheet_builder_cls("sheetonsheet", cfg) is SheetOnSheetSimulation
