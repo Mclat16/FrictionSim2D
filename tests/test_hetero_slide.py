@@ -1,7 +1,9 @@
 """Tests for D1 hetero sheet-on-sheet slide assembly helpers."""
-from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
-from ase.io import read
+from ase import Atoms
+from ase.io import read, write
 from src.core.config import SheetOnSheetSimulationConfig, load_settings
 from src.builders.hetero import build_hetero_structure
 from src.builders.hetero_slide import compute_layer_zbands
@@ -33,3 +35,86 @@ def test_layer_zbands_partition_all_atoms(tmp_path):
     for zi in z:
         hits = [b for b in bands if b["zlo"] <= zi <= b["zhi"]]
         assert len(hits) == 1, f"z={zi} in {len(hits)} bands"
+
+    # Physical correctness: each band must contain exactly the atom count of
+    # the layer actually placed at that z-order -- not merely satisfy a
+    # contiguous non-overlapping split (any gap-clustering split, including a
+    # WRONG one, would still satisfy the assertions above). Bands are ordered
+    # bottom->top by layer placement (source native z-range + z-shift), which
+    # is exact and independent of gap heuristics -- so this catches silent
+    # mis-grouping that gap-clustering could produce for puckered layers
+    # (e.g. black phosphorus, GeS) where an intra-layer sub-plane gap exceeds
+    # an inter-layer gap.
+    native_zrange = {}
+    for layer in stack.layers:
+        key = str(layer.source)
+        if key not in native_zrange:
+            zz = read(key, format="lammps-data").get_positions()[:, 2]
+            native_zrange[key] = (float(zz.min()), float(zz.max()))
+    layers_sorted_by_z = sorted(
+        stack.layers,
+        key=lambda layer: 0.5 * sum(native_zrange[str(layer.source)]) + layer.z,
+    )
+    assert len(layers_sorted_by_z) == len(bands)
+    for band, layer in zip(bands, layers_sorted_by_z):
+        expected = len(read(str(layer.source), format="lammps-data"))
+        actual = int(np.sum((band["zlo"] <= z) & (z <= band["zhi"])))
+        assert actual == expected, (
+            f"band idx={band['idx']} (z=[{band['zlo']:.3f}, {band['zhi']:.3f}]) has "
+            f"{actual} atoms, expected {expected} (atom count of the layer placed "
+            f"at this z-order, source={layer.source})"
+        )
+
+
+def _write_zcol_atoms(path, zs, cell_xy=(10.0, 10.0)):
+    """Write a minimal LAMMPS data file with one atom per given z (fixed xy)."""
+    cell3 = np.array([
+        [cell_xy[0], 0.0, 0.0],
+        [0.0, cell_xy[1], 0.0],
+        [0.0, 0.0, 50.0],
+    ])
+    positions = [[1.0 + 0.1 * i, 1.0, z] for i, z in enumerate(zs)]
+    atoms = Atoms(symbols=["H"] * len(zs), positions=positions, cell=cell3, pbc=True)
+    write(str(path), atoms, format="lammps-data", atom_style="atomic")
+    return path
+
+
+def test_layer_zbands_catches_puckered_layer_misgrouping(tmp_path):
+    """Reviewer's counter-example: a puckered layer (two sub-planes with an
+    INTERNAL z-gap larger than the real inter-layer gap) fools gap-clustering
+    (the old "(n-1) largest z-gaps" heuristic) into cutting INSIDE the
+    puckered layer instead of at the true material boundary -- silently
+    mis-grouping atoms. Real puckered 2D materials (black phosphorus, GeS)
+    can have exactly this shape. The placement-based fix (known `.source`
+    native z-range + `.z` shift) is exact and immune to this, because it
+    never looks at gaps at all.
+
+    This test is RED against the old gap-clustering implementation and GREEN
+    against the placement-based fix.
+    """
+    # Layer A: puckered, native atoms at z = 0.0 and 10.0 (internal gap 10.0),
+    # placed with no z-shift -> occupies real z in {0.0, 10.0}.
+    src_a = _write_zcol_atoms(tmp_path / "puckered_a.lmp", [0.0, 10.0])
+    # Layer B: a single atom at native z = 0.0, placed with a 13.0 z-shift ->
+    # occupies real z = 13.0. The true inter-layer gap (A's top at 10.0 to B's
+    # bottom at 13.0) is only 3.0 -- smaller than A's own internal 10.0 gap.
+    src_b = _write_zcol_atoms(tmp_path / "flat_b.lmp", [0.0])
+
+    layers = [
+        SimpleNamespace(source=src_a, z=0.0),
+        SimpleNamespace(source=src_b, z=13.0),
+    ]
+    # The assembled structure is literally A's atoms (unshifted) + B's atom
+    # shifted by 13.0 -- exactly what `read_data ... shift 0 0 13.0` produces.
+    data_path = _write_zcol_atoms(tmp_path / "hetero.lmp", [0.0, 10.0, 13.0])
+
+    bands = compute_layer_zbands(data_path, layers)
+    assert [b["idx"] for b in bands] == [1, 2]
+
+    z = read(str(data_path), format="lammps-data").get_positions()[:, 2]
+    counts = [int(np.sum((b["zlo"] <= z) & (z <= b["zhi"]))) for b in bands]
+    # Band 1 (layer A, the puckered layer) must contain BOTH of A's atoms;
+    # band 2 (layer B) must contain exactly B's single atom. The old gap
+    # heuristic instead cuts at the largest gap (A's own internal 10.0 gap),
+    # yielding counts=[1, 2] -- silently wrong.
+    assert counts == [2, 1], f"counts={counts} (old gap-clustering mis-groups this exact case)"
