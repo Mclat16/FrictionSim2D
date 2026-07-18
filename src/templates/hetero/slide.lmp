@@ -1,0 +1,208 @@
+# LAMMPS Input Script for Sheet-vs-Sheet Sliding
+# {{ n_layers }}-layer model, constraint_mode: {{ constraint_mode }}
+
+{% if scan_speed_config is iterable and scan_speed_config is not string %}
+variable        speed index {{ scan_speed_config | join(' ') }}
+label           speed_loop
+{% else %}
+variable        speed equal {{ scan_speed_config }}
+{% endif %}
+
+{% if pressures is iterable and pressures is not string %}
+variable        pressure index {{ pressures | join(' ') }}
+label           pressure_loop
+{% else %}
+variable        pressure equal {{ pressures }}
+{% endif %}
+
+{% if scan_angle_config is iterable and scan_angle_config is not string and scan_angle_config|length > 0 %}
+variable        a index {{ scan_angle_config | join(' ') }}
+label           angle_loop
+{% else %}
+variable        a equal {{ scan_angle_config if scan_angle_config is not none else 0 }}
+{% endif %}
+
+{% set scan_angle_force_is_sequence = scan_angle_force is iterable and scan_angle_force is not string and scan_angle_force|length > 0 %}
+{% if scan_angle_force_is_sequence %}
+variable        scan_angle_force index {{ scan_angle_force | join(' ') }}
+{% elif scan_angle_force is number %}
+variable        scan_angle_force equal {{ scan_angle_force }}
+{% endif %}
+
+clear
+units           metal
+atom_style      {{ atom_style }}
+boundary        p p p
+
+neighbor        {{ neighbor_list }} bin
+{{ neigh_modify_command }}
+
+comm_style      tiled
+
+region          box block {{ xlo }} {{ xhi }} {{ ylo }} {{ yhi }} -15.0 {{ zhi + 15 }} units box
+read_data       {{ data_file }} group all_atoms
+change_box      all z final -15.0 {{ zhi + 15 }} units box
+
+include         {{ potential_file }}
+
+# ---- Layer groups by initial z-slab (hetero: shared types, so region not type) ----
+{% for layer in layers %}
+region          reg_layer_{{ layer.idx }} block INF INF INF INF {{ '%.4f'|format(layer.zlo) }} {{ '%.4f'|format(layer.zhi) }} units box
+group           layer_{{ layer.idx }} region reg_layer_{{ layer.idx }}
+{% endfor %}
+
+{% if pot_type == 'reaxff' %}
+fix             qeq all qeq/reaxff 1 0.0 10.0 1.0e-6 reaxff
+{% elif pot_type == 'reax/c' %}
+fix             qeq all qeq/reax 1 0.0 10.0 1.0e-6 reax/c
+{% endif %}
+
+{% if dump_enabled %}
+dump            sys all atom {{ dump_freq }} {{ dump_file_pattern }}
+{% endif %}
+
+balance         1.0 rcb
+
+min_style       {{ min_style }}
+{{ minimization_command }}
+
+# Thermostat on middle layers (2 through {{ n_layers - 1 }})
+group           center union {% for i in range(2, n_layers) %}layer_{{ i }}{{ ' ' if not loop.last }}{% endfor %}
+
+velocity        center create {{ temp }} {{ range(1, 999999) | random }}
+{% if thermostat_type == 'nose-hoover' %}
+fix             nvt_center center nvt temp {{ temp }} {{ temp }} $(100.0*dt)
+{% else %}
+fix             lang center langevin {{ temp }} {{ temp }} $(100.0*dt) {{ range(1, 999999) | random }} zero yes
+fix             nve_center center nve
+{% endif %}
+
+timestep        {{ timestep }}
+thermo          {{ thermo }}
+
+# Top layer (layer {{ n_layers }}): driven
+{% if drive_method == 'fix_move' %}
+fix             fstage_top layer_{{ n_layers }} rigid/nve single force * off off on torque * off off off
+{% else %}
+fix             fstage_top layer_{{ n_layers }} rigid/nve single force * on on on torque * off off off
+{% endif %}
+# Bottom layer (layer 1): fixed
+fix             fsbot layer_1 setforce 0.0 0.0 0.0
+velocity        layer_1 set 0.0 0.0 0.0 units box
+
+# COM computes for key layers
+compute         COM_top layer_{{ n_layers }} com
+variable        comx_top equal c_COM_top[1]
+variable        comy_top equal c_COM_top[2]
+variable        comz_top equal c_COM_top[3]
+
+compute         COM_ctop layer_{{ n_layers - 1 }} com
+variable        comx_ctop equal c_COM_ctop[1]
+variable        comy_ctop equal c_COM_ctop[2]
+variable        comz_ctop equal c_COM_ctop[3]
+
+compute         COM_cbot layer_2 com
+variable        comx_cbot equal c_COM_cbot[1]
+variable        comy_cbot equal c_COM_cbot[2]
+variable        comz_cbot equal c_COM_cbot[3]
+
+compute         COM_bot layer_1 com
+variable        comx_bot equal c_COM_bot[1]
+variable        comy_bot equal c_COM_bot[2]
+variable        comz_bot equal c_COM_bot[3]
+
+# Apply Uniform Pressure
+# 1 eV/Å³ = {{ ev_a3_to_gpa }} GPa
+variable        A equal ({{ xhi }}-{{ xlo }})*({{ yhi }}-{{ ylo }})
+variable        p equal v_pressure/{{ ev_a3_to_gpa }}
+variable        f equal -v_p*v_A/(count(layer_{{ n_layers }}))
+
+fix             force layer_{{ n_layers }} aveforce 0.0 0.0 $f
+
+variable        fx equal f_force[1]*{{ ev_a_to_nn }}
+variable        fy equal f_force[2]*{{ ev_a_to_nn }}
+variable        fz equal f_force[3]*{{ ev_a_to_nn }}
+variable        sx equal f_fsbot[1]*{{ ev_a_to_nn }}
+variable        sy equal f_fsbot[2]*{{ ev_a_to_nn }}
+variable        sz equal f_fsbot[3]*{{ ev_a_to_nn }}
+
+{% if has_internal_lj %}
+# Many-body potential ({{ pot_type }}): compute group/group not supported.
+# Using bottom-layer reaction forces as lateral friction proxy.
+# If friction values look wrong, verify pot_type classification in
+# PotentialManager.is_sheet_lj() (src/core/potential_manager.py).
+variable        xfrict equal v_sx
+variable        yfrict equal v_sy
+{% else %}
+compute         frict layer_{{ n_layers - 1 }} group/group layer_{{ n_layers - 2 }}
+variable        xfrict equal c_frict[1]
+variable        yfrict equal c_frict[2]
+{% endif %}
+
+run             10000
+
+{% if constraint_mode == 'com_spring' %}
+# COM spring tethering top two layers
+fix             com_spring layer_{{ n_layers }} spring couple layer_{{ n_layers - 1 }} {{ bond_spring_ev }} 0.0 0.0 NULL 0.0
+{% endif %}
+
+variable        speed_x equal cos(v_a*PI/180)
+variable        speed_y equal sin(v_a*PI/180)
+
+{% if drive_method == 'smd' %}
+fix             spr layer_{{ n_layers }} smd cvel {{ driving_spring_ev }} ${speed/100} tether $(v_speed_x) $(v_speed_y) NULL 0.0
+
+{% elif drive_method == 'fix_move' %}
+velocity        layer_{{ n_layers }} set 0.0 0.0 0.0 units box
+velocity        layer_{{ n_layers }} set $(v_speed_x*v_speed/100) $(v_speed_y*v_speed/100) 0.0
+
+{% elif drive_method == 'virtual_atom' %}
+create_atoms    {{ num_atom_types }} single $(xcm(layer_{{ n_layers }},x)) $(xcm(layer_{{ n_layers }},y)) $(xcm(layer_{{ n_layers }},z)+10) units box
+group           virtual type {{num_atom_types}}
+velocity        virtual set 0.0 0.0 0.0
+
+fix             spr layer_{{ n_layers }} spring couple virtual {{ driving_spring_ev }} 0.0 0.0 NULL 0
+fix             move_virtual virtual move linear $(v_speed*v_speed_x/100) $(v_speed*v_speed_y/100) 0.0
+{% endif %}
+
+fix             fc_ave all ave/time 1 1000 {{ results_freq }} v_xfrict v_yfrict v_sx v_sy v_sz v_fx v_fy v_fz v_comx_top v_comy_top v_comx_ctop v_comy_ctop v_comz_ctop v_comx_cbot v_comy_cbot v_comz_cbot file {{ results_file_pattern }}
+
+run             {{ run_steps }}
+
+{% if scan_angle_config is iterable and scan_angle_config is not string and scan_angle_config|length > 0 %}
+{% if scan_angle_force is number or scan_angle_force_is_sequence %}
+if              'abs(v_pressure-v_scan_angle_force) < 1.0e-12' then &
+                "next a" &
+                "clear" &
+                "jump SELF angle_loop"
+{% else %}
+next            a
+clear
+jump            SELF angle_loop
+{% endif %}
+{% endif %}
+
+{% if scan_angle_config is iterable and scan_angle_config is not string and scan_angle_config|length > 0 and scan_angle_force_is_sequence %}
+if              'abs(v_pressure-v_scan_angle_force) < 1.0e-12' then "next scan_angle_force"
+{% endif %}
+
+{% if pressures is iterable and pressures is not string %}
+next            pressure
+clear
+{% if scan_angle_config is iterable and scan_angle_config is not string and scan_angle_config|length > 0 %}
+variable        a delete
+{% endif %}
+jump            SELF pressure_loop
+{% endif %}
+
+{% if scan_speed_config is iterable and scan_speed_config is not string %}
+next            speed
+clear
+{% if pressures is iterable and pressures is not string %}
+variable        pressure delete
+{% endif %}
+{% if scan_angle_config is iterable and scan_angle_config is not string and scan_angle_config|length > 0 %}
+variable        a delete
+{% endif %}
+jump            SELF speed_loop
+{% endif %}

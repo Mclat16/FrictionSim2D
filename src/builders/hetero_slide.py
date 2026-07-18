@@ -1,8 +1,29 @@
 """D1 hetero sheet-on-sheet slide assembly (consumes hetero.py's structure builder)."""
 from typing import List, Dict
 from ase.io import read
+from jinja2 import Environment
+
+from ..interfaces.jinja import PackageLoader
 
 PAD = 1.0  # Å pad above/below each layer's atom z-range
+
+# Same Jinja environment construction as SimulationBase.__init__
+# (src/core/simulation_base.py:80-84): package-resource loader, trimmed blocks.
+_ENV = Environment(
+    loader=PackageLoader('src.templates'),
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+
+def render_hetero_slide(context: Dict) -> str:
+    """Render ``hetero/slide.lmp`` with the given context.
+
+    Thin module-level helper mirroring how builders render templates via
+    ``SimulationBase.render_template``, without needing a full builder
+    instance.
+    """
+    return _ENV.get_template("hetero/slide.lmp").render(context)
 
 
 def compute_layer_zbands(data_path, layers) -> List[Dict]:

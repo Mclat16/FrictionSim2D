@@ -6,7 +6,7 @@ from ase import Atoms
 from ase.io import read, write
 from src.core.config import SheetOnSheetSimulationConfig, load_settings
 from src.builders.hetero import build_hetero_structure
-from src.builders.hetero_slide import compute_layer_zbands
+from src.builders.hetero_slide import compute_layer_zbands, render_hetero_slide
 
 MAT, POT = "examples/materials", "examples/potentials/sw"
 
@@ -118,3 +118,77 @@ def test_layer_zbands_catches_puckered_layer_misgrouping(tmp_path):
     # heuristic instead cuts at the largest gap (A's own internal 10.0 gap),
     # yielding counts=[1, 2] -- silently wrong.
     assert counts == [2, 1], f"counts={counts} (old gap-clustering mis-groups this exact case)"
+
+
+def _minimal_slide_context(layers):
+    """Fill every key referenced by ``SheetOnSheetSimulation.write_inputs``'s
+    ``base_context`` (src/builders/sheetonsheet.py), plus ``layers`` (Task 1's
+    ``compute_layer_zbands`` output), so ``hetero/slide.lmp`` can render
+    without hitting an undefined Jinja variable.
+    """
+    return {
+        "temp": 300,
+        "xlo": 0.0,
+        "xhi": 40.0,
+        "ylo": 0.0,
+        "yhi": 40.0,
+        "zhi": 40.0,
+        "data_file": "run/build/hetero.data",
+        "potential_file": "run/lammps/system.in.settings",
+        "num_atom_types": 4,
+        "ngroups": 4,
+        "n_layers": 4,
+        "constraint_mode": "none",
+        "n_bond_types": 0,
+        "drive_method": "virtual_atom",
+        "thermostat_type": "langevin",
+        "atom_style": "atomic",
+        "pot_type": "sw",
+        "has_internal_lj": True,
+        "pressures": 0.0,
+        "scan_speed_config": 1,
+        "scan_angle_config": 0,
+        "scan_angle_force": None,
+        "timestep": 0.001,
+        "thermo": 1000,
+        "run_steps": 10000,
+        "min_style": "cg",
+        "minimization_command": "minimize 1.0e-8 1.0e-10 10000 100000",
+        "neighbor_list": "2.0",
+        "neigh_modify_command": "neigh_modify every 1 delay 0 check yes",
+        "results_freq": 1000,
+        "results_file_pattern": "run/results/friction_p${pressure}_a${a}_s${speed}",
+        "dump_enabled": False,
+        "dump_freq": 1000,
+        "dump_file_pattern": "run/visuals/slide.lammpstrj",
+        "driving_spring_ev": 3.121,
+        "bond_spring_ev": 4.994,
+        "lat_c": 3.16,
+        "ev_a_to_nn": 160.2176565,
+        "ev_a3_to_gpa": 160.2176565,
+        "layers": layers,
+    }
+
+
+def test_hetero_slide_defines_layer_groups_by_region():
+    layers = [{"idx": i, "zlo": 5.0 * i, "zhi": 5.0 * i + 3.0} for i in range(1, 5)]
+    ctx = _minimal_slide_context(layers)
+    script = render_hetero_slide(ctx)
+
+    # Layer groups defined by region, NOT by `group layer_N type` (hetero
+    # layers share atom types, so type-based groups are impossible).
+    assert "region          reg_layer_1" in script or "region reg_layer_1" in script
+    for i in range(1, 5):
+        assert "group" in script and f"layer_{i}" in script
+        assert f"group           layer_{i} region reg_layer_{i}" in script
+    assert "group layer_1 type" not in script
+
+    # Single read of the already-assembled hetero stack -- no `add append`
+    # multi-stack read like the homogeneous template's create_box branch.
+    assert script.count("read_data") == 1
+    assert "add append" not in script
+
+    # The homogeneous slide body (thermostat, drive, pressure, friction proxy)
+    # is reused verbatim.
+    assert "center" in script and "fix" in script
+    assert "aveforce" in script
