@@ -1,4 +1,6 @@
 """Tests for D1 hetero sheet-on-sheet slide assembly helpers."""
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +19,7 @@ from src.builders.sheetonsheet import SheetOnSheetSimulation
 from src.core.run import _select_sheet_builder_cls
 
 MAT, POT = "examples/materials", "examples/potentials/sw"
+LMP = shutil.which("lmp_serial")
 
 
 def _hetero_2p2_config():
@@ -250,3 +253,123 @@ def test_routing_selects_homogeneous_for_single_material():
     cfg = _single_material_config()
     assert len(cfg.sheets) == 1
     assert _select_sheet_builder_cls("sheetonsheet", cfg) is SheetOnSheetSimulation
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end smoke: build a real 2+2 MoS2/WS2 hetero slide and RUN it in LAMMPS
+# --------------------------------------------------------------------------- #
+
+def _run_lammps_slide(run_dir, slide_in_name, timeout=180):
+    """Run ``lmp_serial`` on the rendered hetero slide and return
+    ``(completed_process, combined_output)``.
+
+    ``cwd`` MUST be ``run_dir``: every path baked into ``slide.in`` is
+    RUN-DIR-RELATIVE (``hetero.data``, ``lammps/system.in.settings``, the
+    settings' ``provenance/potentials/...`` prefix, ``results/...``), so they
+    only resolve when LAMMPS is launched from the run dir. ``combined_output``
+    is stdout + stderr + the LAMMPS ``log.lammps`` (if written), so callers can
+    grep it for errors / "Lost atoms".
+    """
+    run_dir = Path(run_dir)
+    proc = subprocess.run(
+        ["lmp_serial", "-in", str(run_dir / "lammps" / slide_in_name)],
+        cwd=str(run_dir),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    combined = f"{proc.stdout}\n{proc.stderr}"
+    log = run_dir / "log.lammps"
+    if log.exists():
+        combined += "\n" + log.read_text()
+    return proc, combined
+
+
+def _read_friction_records(friction_path):
+    """Parse a ``fix ave/time`` results file into ``(column_names, rows)``.
+
+    The second comment line names the columns
+    (``# TimeStep v_xfrict ... v_comx_top v_comy_top ...``); data rows are the
+    non-comment lines. Column order is taken from that header (which mirrors the
+    rendered ``fix fc_ave ... ave/time`` output list), so the parse survives any
+    reordering of the emitted variables. ``column_names`` includes the leading
+    ``TimeStep`` and is index-aligned with every data row.
+    """
+    cols = None
+    rows = []
+    for line in Path(friction_path).read_text().splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            toks = s.lstrip("#").split()
+            if toks and toks[0] == "TimeStep":
+                cols = toks
+            continue
+        rows.append([float(x) for x in s.split()])
+    return cols, rows
+
+
+@pytest.mark.skipif(LMP is None, reason="lmp_serial not on PATH")
+def test_hetero_slide_runs_and_drives_top_layer(tmp_path):
+    """Capstone D1 smoke: assemble a real MoS2/WS2 2+2 hetero stack and actually
+    RUN the slide in LAMMPS for a few thousand steps (NOT mocked). Proves the
+    whole pipeline works end to end: run-dir-relative path resolution (data,
+    settings, staged potentials, results), the box + z-vacuum, the z-band layer
+    groups, and a live virtual_atom drive on the top layer.
+    """
+    cfg = _hetero_2p2_config()
+    # A tiny driven run for a smoke. The friction fix is
+    # ``ave/time 1 1000 {{results_freq}}`` (Nrepeat=1000, Nfreq=results_freq=1000)
+    # and is defined AFTER the template's fixed 10000-step equilibration, so its
+    # first record lands at step 12000 and one more every 1000 steps thereafter.
+    # 4000 driven steps -> records at 12000/13000/14000 (>=2, needed for the
+    # displacement check). The whole LAMMPS run is ~5 s at this size (~288 atoms).
+    cfg.settings.simulation.slide_run_steps = 4000
+    cfg.settings.simulation.drive_method = "virtual_atom"
+    # The matched supercell must be larger than the hetero cross-LJ cutoff
+    # (``pair_style hybrid ... lj/cut 11.0``) or ``comm_style tiled`` aborts with
+    # "Communication cutoff ... cannot exceed periodic box length". The 12 A
+    # target of _hetero_2p2_config yields an ~11.04 A box edge (too tight); a
+    # 14 A target gives a ~12.7 A min edge, comfortably clear of 11.0 + skin.
+    for sheet in cfg.sheets:
+        sheet.x = 14.0
+        sheet.y = 14.0
+    # Drive fast enough that the drive translation dominates thermal COM jitter
+    # (speed=100 -> ~1 A/ps -> ~3 A of top-layer travel over the driven run).
+    cfg.general.scan_speed = 100
+
+    sim = HeteroSheetOnSheetSimulation(cfg, str(tmp_path))
+    sim.build()
+
+    slide = next(Path(tmp_path).rglob("slide*.in"))
+    # run dir = the dir that holds lammps/, hetero.data, provenance/, results/
+    run_dir = slide.parent.parent
+    assert (run_dir / "hetero.data").exists()
+    assert (run_dir / "lammps" / "system.in.settings").exists()
+
+    proc, out = _run_lammps_slide(run_dir, slide.name)
+
+    # 1) LAMMPS finished cleanly, with no lost atoms.
+    assert proc.returncode == 0, f"lmp_serial exited {proc.returncode}:\n{out[-3000:]}"
+    assert "Lost atoms" not in out, f"atoms lost during slide:\n{out[-3000:]}"
+
+    # 2) A non-empty friction results file was written into results/.
+    friction = next(run_dir.rglob("friction_*"))
+    assert friction.stat().st_size > 0, f"empty friction file: {friction}"
+
+    # 3) The drive is LIVE: the top layer's in-plane COM moved a nonzero net
+    #    amount between the first and last record. A virtual_atom drive at
+    #    nonzero speed MUST translate it (here ~3 A along the drive axis, well
+    #    above the ~0.5 A thermal COM jitter of a 48-atom layer).
+    cols, rows = _read_friction_records(friction)
+    assert cols is not None, f"no column header parsed from {friction}"
+    assert len(rows) >= 2, f"need >=2 records to measure displacement, got {len(rows)}"
+    ix, iy = cols.index("v_comx_top"), cols.index("v_comy_top")
+    dx = rows[-1][ix] - rows[0][ix]
+    dy = rows[-1][iy] - rows[0][iy]
+    disp = (dx * dx + dy * dy) ** 0.5
+    assert disp > 0.5, (
+        f"top-layer COM barely moved (dx={dx:.3f}, dy={dy:.3f}, |d|={disp:.3f} A); "
+        f"virtual_atom drive appears dead"
+    )

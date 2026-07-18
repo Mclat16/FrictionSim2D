@@ -215,7 +215,13 @@ class HeteroSheetOnSheetSimulation(SimulationBase):
             "atom_style": atom_style,
             "pot_type": "sw",
             "has_internal_lj": True,  # hybrid sw -> reaction-force friction proxy
-            "pressures": general.pressure,
+            # Default an unset load to 0.0 (zero-load slide). A raw None renders
+            # ``variable pressure equal None`` -> LAMMPS "Invalid thermo keyword
+            # 'None' in variable formula", breaking every default-config run.
+            # Mirrors the homogeneous loop-path fallback ``pressures or [0.0]``
+            # (src/builders/sheetonsheet.py) which never reaches the template
+            # with a bare None.
+            "pressures": general.pressure if general.pressure is not None else 0.0,
             "scan_speed_config": general.scan_speed,
             "scan_angle_config": general.scan_angle,
             "scan_angle_force": general.scan_angle_force,
