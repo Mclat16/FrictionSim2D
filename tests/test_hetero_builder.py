@@ -164,6 +164,77 @@ def test_hetero_type_blocks_disjoint_and_potentials_complete(tmp_path):
     assert hp.type_offsets == [ids[0] - 1 for ids in hp.type_ids]
 
 
+def _sw_element_list(pair_coeff_line):
+    """Extract the trailing element list from a hybrid ``pair_coeff * * sw ...``
+    line, i.e. every token after the potential-file path (the token containing a
+    ``/`` or ``.``), stripped of any comment. For ``pair_coeff * * sw 1
+    provenance/potentials/MoS2_wen.sw Mo S NULL NULL`` this returns
+    ``['Mo', 'S', 'NULL', 'NULL']`` -- one entry per box atom type, which is what
+    LAMMPS requires for a many-body pair_coeff.
+    """
+    main = pair_coeff_line.split("#", 1)[0].strip()
+    tokens = main.split()
+    path_idx = next(i for i, t in enumerate(tokens) if "/" in t or "." in t)
+    return tokens[path_idx + 1:]
+
+
+def test_reserve_virtual_type_sizes_sw_element_lists_and_default_unchanged(tmp_path):
+    """``reserve_virtual_type=True`` registers ONE extra non-interacting virtual
+    type BEFORE the many-body self-interactions (the homogeneous drive-atom
+    ordering), so every ``pair_coeff * * sw ...`` element list is sized to the
+    full box type count (real types + a trailing NULL for the virtual type) the
+    first time -- LAMMPS-acceptable, no post-hoc rebuild -- and the settings
+    carry the virtual type's zero-LJ ``pair_coeff``. The default
+    (``reserve_virtual_type=False``) is the real-types-only spine: no virtual
+    type, no ``1e-100`` term, sw lists sized to the real count.
+    """
+    sheets = [
+        _sheet_config("h-MoS2", MOS2_CIF, MOS2_POT),
+        _sheet_config("h-WS2", WS2_CIF, WS2_POT),
+    ]
+    settings = load_settings()
+
+    # --- default: NO virtual type, sw lists sized to the real count ----------
+    hp_def = register_hetero_potentials(sheets, settings, workdir=tmp_path / "default")
+    real_count = sum(len(ids) for ids in hp_def.type_ids)
+    assert len(hp_def.pm.types) == real_count            # no extra type
+    def_text = Path(hp_def.settings_path).read_text()
+    assert "1e-100" not in def_text                       # no virtual pair_coeff
+    assert "Virtual" not in def_text
+    def_sw = [l for l in def_text.splitlines() if l.strip().startswith("pair_coeff * * sw")]
+    assert len(def_sw) == len(sheets)
+    for line in def_sw:
+        assert len(_sw_element_list(line)) == real_count
+
+    # --- reserve_virtual_type=True: exactly ONE extra type -------------------
+    hp = register_hetero_potentials(
+        sheets, settings, workdir=tmp_path / "virtual", reserve_virtual_type=True
+    )
+    # type_ids/component_names still describe the REAL materials only ...
+    assert sum(len(ids) for ids in hp.type_ids) == real_count
+    assert hp.component_names == hp_def.component_names
+    # ... while pm.types holds one extra (virtual) type.
+    assert len(hp.pm.types) == real_count + 1
+    n_box_types = len(hp.pm.types)
+
+    text = Path(hp.settings_path).read_text()
+    # (a) the virtual type's zero-LJ pair_coeff + mass are present on type N.
+    assert f"pair_coeff * {n_box_types} lj/cut 1e-100 1e-100" in text
+    assert "Virtual atom" in text                         # mass N 1.0 #Virtual atom
+    # (b) EVERY many-body sw element list is sized to the full box type count
+    #     (real types + trailing NULL for the virtual type) -> LAMMPS accepts it.
+    sw_lines = [l for l in text.splitlines() if l.strip().startswith("pair_coeff * * sw")]
+    assert len(sw_lines) == len(sheets)
+    for line in sw_lines:
+        elems = _sw_element_list(line)
+        assert len(elems) == n_box_types, (
+            f"sw element list has {len(elems)} entries, expected {n_box_types} "
+            f"(one per box type incl. trailing NULL for the virtual type): {line!r}"
+        )
+        # the reserved virtual type's slot (last) is a non-interacting NULL.
+        assert elems[-1] == "NULL"
+
+
 def _write_synthetic_monolayer(path, cell_2x2, charges=None):
     """Write a minimal 2-atom monolayer LAMMPS data file with a given in-plane cell.
 

@@ -103,12 +103,21 @@ class HeteroPotentials:
     ``lj/cut`` cross-terms for every A-B element pair at the interface -- all
     emitted into ``system.in.settings``.
 
+    ``type_ids`` / ``type_offsets`` / ``component_names`` always describe the
+    REAL material types only. When the manager was built with
+    ``reserve_virtual_type=True`` (for the ``virtual_atom`` drive), an extra
+    non-interacting virtual type is present in ``pm.types`` but is NOT a
+    material, so it is excluded from those fields -- i.e.
+    ``len(pm.types) == (sum of len(ids) for ids in type_ids) + 1`` in that case,
+    and ``== that sum`` otherwise.
+
     Attributes:
         pm: The configured :class:`PotentialManager` (type registry +
-            interactions already written).
+            interactions already written). ``len(pm.types)`` includes the
+            reserved virtual type when one was requested.
         settings_path: Path to the written ``system.in.settings``.
-        component_names: Component name per material, in stacking order
-            (``['sheet_1', 'sheet_2', ...]``).
+        component_names: Component name per REAL material, in stacking order
+            (``['sheet_1', 'sheet_2', ...]``); never includes the virtual type.
         type_ids: Per-material list of that material's global atom-type IDs, in
             stacking order. Read straight from the PM type registry
             (``pm.types.ids_by_component``); never hand-assigned. The blocks are
@@ -129,6 +138,7 @@ def register_hetero_potentials(
     sheets: List[SheetConfig],
     settings: GlobalSettings,
     workdir: PathLike,
+    reserve_virtual_type: bool = False,
 ) -> HeteroPotentials:
     """Register the stacked materials as PotentialManager components.
 
@@ -154,11 +164,30 @@ def register_hetero_potentials(
         settings: Global simulation settings.
         workdir: Directory to write ``system.in.settings`` and the staged
             provenance potentials into (created if missing).
+        reserve_virtual_type: When True, register one extra non-interacting
+            ``virtual`` atom type (for the ``virtual_atom`` drive) AFTER the
+            per-material components but BEFORE the many-body self-interactions --
+            the SAME order the homogeneous path uses
+            (``SheetOnSheetSimulation._register_drive_atom`` runs before
+            ``add_self_interaction``). This sizes every ``pair_coeff * * sw ...``
+            element list to the full box type count (all real types + a trailing
+            NULL for the virtual type) the FIRST time, so no post-hoc
+            clearing/rebuilding of the null-maps is needed, and
+            :meth:`PotentialManager.write_file` emits the virtual type's
+            ``mass N 1.0`` + zero-LJ ``pair_coeff * N lj/cut 1e-100``. The
+            explicit ``i j`` cross-interactions are unaffected by the extra type.
+            The returned ``type_ids``/``type_offsets``/``component_names`` still
+            describe the REAL material types only (the virtual type is NOT a
+            material); only ``len(hp.pm.types)`` includes it (== real count + 1).
+            Default False leaves ALL behavior byte-identical.
 
     Returns:
         :class:`HeteroPotentials` exposing the configured manager, the written
         settings path, and the per-material type blocks / offsets (derived from
-        the PM type registry, not hand-computed).
+        the PM type registry, not hand-computed). ``type_ids`` /
+        ``component_names`` cover the REAL materials only; when
+        ``reserve_virtual_type`` is True, ``len(hp.pm.types)`` is one larger
+        (the reserved virtual type is excluded from ``type_ids``).
 
     Raises:
         ValueError: If fewer than two materials are supplied (a heterostructure
@@ -189,6 +218,16 @@ def register_hetero_potentials(
         name = f"sheet_{i + 1}"
         pm.register_component(name, sheet, n_layers=1)
         component_names.append(name)
+
+    # 1b. Optionally reserve the dedicated non-interacting virtual type for the
+    #     virtual_atom drive -- BEFORE the self-interactions, mirroring the
+    #     homogeneous drive-atom ordering. Registering it here (not after) means
+    #     each many-body null-map below is built over the full box type count, so
+    #     ``pair_coeff * * sw ...`` carries the trailing NULL for the virtual type
+    #     the first time (no clearing/rebuilding). It stays out of type_ids /
+    #     component_names because it is not a material.
+    if reserve_virtual_type:
+        pm.register_virtual_atom()
 
     # 2. Each material's own many-body potential (hybrid entry per component).
     for name in component_names:
