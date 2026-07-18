@@ -406,8 +406,8 @@ def hpc_generate(simulation_dir: str, settings_file: Optional[Path],
 
     settings = load_settings(settings_file=settings_file)
     _ensure_hpc_settings(settings.hpc)
+    settings.hpc.scheduler_type = scheduler  # CLI --scheduler overrides the settings default
     hpc_config = HPCConfig.from_settings(settings.hpc)
-    hpc_config.scheduler_type = scheduler  # type: ignore[assignment]
 
     simulation_paths = []
     script_names = hpc_config.lammps_scripts or ['system.in', 'slide.in']
