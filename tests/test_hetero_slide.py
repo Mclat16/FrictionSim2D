@@ -1,4 +1,5 @@
 """Tests for D1 hetero sheet-on-sheet slide assembly helpers."""
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -235,6 +236,120 @@ def test_builder_writes_slide_in_referencing_hetero_stack(tmp_path):
     assert "group           layer_1 region" in text or "layer_1 region" in text
 
 
+def _real_atom_types(data_path):
+    """Parse the set of integer atom types present in a LAMMPS data file's
+    ``Atoms`` section (i.e. the REAL types actually written to ``hetero.data``).
+
+    Robust to the ``Atoms # atomic`` header and any following section
+    (``Velocities`` ...): once inside ``Atoms``, data lines start with an
+    integer atom id, so the first non-integer-leading line ends the section.
+    """
+    types = set()
+    in_atoms = False
+    for raw in Path(data_path).read_text().splitlines():
+        s = raw.split("#", 1)[0].strip()
+        if not s:
+            continue
+        if s.startswith("Atoms"):
+            in_atoms = True
+            continue
+        if in_atoms:
+            tok = s.split()
+            if not tok[0].lstrip("-").isdigit():
+                break  # reached the next section header
+            if len(tok) >= 2:
+                types.add(int(tok[1]))
+    return types
+
+
+def test_virtual_atom_drive_reserves_dedicated_nonreal_type(tmp_path):
+    """Regression for the D1 CRITICAL bug: the default ``virtual_atom`` hetero
+    drive reused ``num_atom_types = total_real_types`` for
+    ``create_atoms``/``group virtual type N``, so the group grabbed the WHOLE
+    highest-real-type sublattice (spread across the driven top AND the
+    thermostatted center layer) and ``fix move`` rigidly dragged those REAL
+    atoms -- wrong friction, silent.
+
+    The fix reserves a DEDICATED non-interacting virtual type
+    (``N = total_real + 1``, a type no real atom has), reads the data with
+    ``extra/atom/types 1`` so the box has room for it, and writes its zero-LJ
+    ``pair_coeff`` into ``system.in.settings``.
+
+    RED on the pre-fix code (N == highest real type, IN real_types; no
+    ``extra/atom/types``; no virtual pair_coeff), GREEN after.
+    """
+    cfg = _hetero_2p2_config()
+    cfg.settings.simulation.drive_method = "virtual_atom"
+    sim = HeteroSheetOnSheetSimulation(cfg, str(tmp_path))
+    sim.build()
+
+    slide = next(Path(tmp_path).rglob("slide*.in"))
+    run_dir = slide.parent.parent
+    data_path = run_dir / "hetero.data"
+    settings_path = run_dir / "lammps" / "system.in.settings"
+
+    real_types = _real_atom_types(data_path)
+    assert real_types, "no atom types parsed from hetero.data"
+    total_real = max(real_types)
+    # Real types are a contiguous 1..total_real block (the PM spine).
+    assert real_types == set(range(1, total_real + 1)), (
+        f"real types {sorted(real_types)} are not the contiguous block "
+        f"1..{total_real}"
+    )
+    n_virtual = total_real + 1
+    # (a) The virtual driver is created/grouped on a type NO real atom has.
+    assert n_virtual not in real_types
+    text = slide.read_text()
+    assert re.search(rf"create_atoms\s+{n_virtual}\s+single", text), (
+        f"expected create_atoms of the reserved virtual type {n_virtual}; "
+        f"slide.in:\n{text}"
+    )
+    assert re.search(rf"group\s+virtual\s+type\s+{n_virtual}\b", text), (
+        f"expected 'group virtual type {n_virtual}' (a non-real type); slide.in "
+        f"still groups a real type -> drags a real sublattice"
+    )
+    # (b) The box reserves the extra type or LAMMPS errors on create_atoms.
+    assert "extra/atom/types 1" in text, (
+        "read_data must reserve 'extra/atom/types 1' for the virtual type"
+    )
+    # (c) The settings declare the virtual type + its zero-LJ pair_coeff.
+    settings_text = settings_path.read_text()
+    assert f"pair_coeff * {n_virtual} lj/cut 1e-100 1e-100" in settings_text, (
+        f"system.in.settings must carry the virtual type's zero-LJ pair_coeff "
+        f"for type {n_virtual}; got:\n{settings_text}"
+    )
+    assert "Virtual atom" in settings_text  # mass N 1.0 #Virtual atom
+
+
+def test_non_virtual_drive_reserves_no_virtual_type(tmp_path):
+    """Guard the other drives: a ``fix_move`` (non-virtual) hetero slide must
+    NOT reserve a virtual type -- no ``extra/atom/types``, no virtual
+    ``create_atoms``/``group``, and ``num_atom_types`` stays == the real type
+    count (settings declare no type beyond the highest real one).
+    """
+    cfg = _hetero_2p2_config()
+    cfg.settings.simulation.drive_method = "fix_move"
+    sim = HeteroSheetOnSheetSimulation(cfg, str(tmp_path))
+    sim.build()
+
+    slide = next(Path(tmp_path).rglob("slide*.in"))
+    run_dir = slide.parent.parent
+    data_path = run_dir / "hetero.data"
+    settings_text = (run_dir / "lammps" / "system.in.settings").read_text()
+    text = slide.read_text()
+
+    assert "extra/atom/types" not in text
+    assert "create_atoms" not in text
+    assert not re.search(r"group\s+virtual\b", text)
+    assert "1e-100" not in settings_text
+    assert "Virtual atom" not in settings_text
+
+    # num_atom_types stayed == total real types: no type beyond the highest
+    # real one is declared in the settings spine.
+    total_real = max(_real_atom_types(data_path))
+    assert f"pair_coeff * {total_real + 1}" not in settings_text
+
+
 def _single_material_config():
     """A homogeneous config with a single [2D] section -> cfg.sheets has length 1."""
     raw = {
@@ -353,6 +468,20 @@ def test_hetero_slide_runs_and_drives_top_layer(tmp_path):
     # 1) LAMMPS finished cleanly, with no lost atoms.
     assert proc.returncode == 0, f"lmp_serial exited {proc.returncode}:\n{out[-3000:]}"
     assert "Lost atoms" not in out, f"atoms lost during slide:\n{out[-3000:]}"
+
+    # 1b) The virtual_atom drive attaches to EXACTLY ONE reserved atom -- the
+    #     dedicated non-interacting virtual type -- not a whole real sublattice.
+    #     Pre-fix, `group virtual type N` used the highest REAL type and grabbed
+    #     the entire top-type sublattice (~dozens of atoms across the driven top
+    #     AND the thermostatted center layer), silently driving the wrong atoms.
+    #     LAMMPS prints "<count> atoms in group virtual"; assert count == 1.
+    m = re.search(r"(\d+) atoms in group virtual", out)
+    assert m is not None, f"no 'atoms in group virtual' line in output:\n{out[-3000:]}"
+    assert m.group(1) == "1", (
+        f"group virtual has {m.group(1)} atoms, expected exactly 1 (the reserved "
+        f"non-interacting virtual atom); >1 means the drive is dragging a real "
+        f"sublattice"
+    )
 
     # 2) A non-empty friction results file was written into results/.
     friction = next(run_dir.rglob("friction_*"))

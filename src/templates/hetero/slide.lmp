@@ -40,7 +40,7 @@ neighbor        {{ neighbor_list }} bin
 comm_style      tiled
 
 region          box block {{ xlo }} {{ xhi }} {{ ylo }} {{ yhi }} -15.0 {{ zhi + 15 }} units box
-read_data       {{ data_file }} group all_atoms
+read_data       {{ data_file }}{% if reserve_virtual_type %} extra/atom/types 1{% endif %} group all_atoms
 change_box      all z final -15.0 {{ zhi + 15 }} units box
 
 include         {{ potential_file }}

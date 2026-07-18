@@ -1,5 +1,6 @@
 """D1 hetero sheet-on-sheet slide assembly (consumes hetero.py's structure builder)."""
 import logging
+from pathlib import Path
 from typing import List, Dict, Optional
 
 import numpy as np
@@ -10,7 +11,11 @@ from ..core.config import SheetOnSheetSimulationConfig
 from ..core.simulation_base import SimulationBase
 from ..data.models import EV_A_TO_NN, EV_A3_TO_GPA, NM_TO_EV_A2
 from ..interfaces.jinja import PackageLoader
-from .hetero import _detect_atom_style, build_hetero_structure
+from .hetero import (
+    _detect_atom_style,
+    build_hetero_structure,
+    register_hetero_potentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +200,70 @@ class HeteroSheetOnSheetSimulation(SimulationBase):
         atom_style = _detect_atom_style(stack.data_path)  # 'atomic' for sw
         lat_c = stack.interface_spacing or settings.geometry.lat_c_default
 
+        # ------------------------------------------------------------------ #
+        # virtual_atom drive: reserve a DEDICATED non-interacting virtual type.
+        #
+        # The reused drive block does ``create_atoms {{num_atom_types}}`` +
+        # ``group virtual type {{num_atom_types}}`` + ``fix move``. If
+        # ``num_atom_types`` were the highest REAL type (``stack.total_types``),
+        # that group would capture the ENTIRE top-type sublattice -- spread
+        # across the driven top AND the thermostatted center layer -- and
+        # rigidly drag those REAL atoms (wrong friction, silent). So, exactly
+        # like the homogeneous path
+        # (``SheetOnSheetSimulation._register_drive_atom`` ->
+        # ``PotentialManager.register_virtual_atom``), add one extra
+        # non-interacting type and make the box reserve room for it.
+        reserve_virtual_type = sim.drive_method == "virtual_atom"
+        num_atom_types = stack.total_types
+        if reserve_virtual_type:
+            # register_hetero_potentials is geometry-independent and
+            # deterministic, so it reproduces the SAME real-type layout
+            # (1..total_types) that build_hetero_structure used to write
+            # hetero.data. We ADD the virtual type and OVERWRITE
+            # lammps/system.in.settings so it carries the extra type's mass +
+            # zero-LJ pair_coeff; hetero.data (real types unchanged) is left
+            # alone, so data and settings stay consistent.
+            hp = register_hetero_potentials(
+                self.config.sheets, self.config.settings, self.output_dir
+            )
+            # Fail loud on any real-type-layout divergence: never ship an
+            # inconsistent settings/data pairing.
+            if len(hp.pm.types) != stack.total_types:
+                raise RuntimeError(
+                    "Re-registered hetero potentials do not match the assembled "
+                    f"stack: {len(hp.pm.types)} real types vs "
+                    f"stack.total_types={stack.total_types}. Refusing to write an "
+                    "inconsistent settings/hetero.data pairing for the "
+                    "virtual_atom drive."
+                )
+            expected_settings = self.output_dir / "lammps" / "system.in.settings"
+            if Path(hp.settings_path).resolve() != expected_settings.resolve():
+                raise RuntimeError(
+                    f"Re-registered settings path {hp.settings_path} != the "
+                    f"settings the slide includes ({expected_settings})."
+                )
+            # Reserve the dedicated non-interacting virtual type. It MUST exist
+            # before the many-body self-interaction null-maps are (re)built, or
+            # the ``pair_coeff * * sw ...`` element list is one short of the box
+            # type count -> LAMMPS "Incorrect args for pair coefficients". This
+            # mirrors the homogeneous path, which registers the virtual atom
+            # BEFORE ``add_self_interaction``. register_hetero_potentials already
+            # built the self-interactions for the real types only, so clear and
+            # rebuild them with the virtual type present (potential_indices reset
+            # so the hybrid ``sw 1``/``sw 2`` indices regenerate identically).
+            # Cross-interactions use explicit ``i j`` type pairs and are
+            # unaffected by the extra type, so they are left intact; write_file
+            # then appends the virtual's ``pair_coeff * N lj/cut 1e-100`` and its
+            # ``mass N 1.0`` for the new type.
+            hp.pm.register_virtual_atom()
+            hp.pm.self_interaction_commands.clear()
+            hp.pm.potential_indices.clear()
+            for name in hp.component_names:
+                hp.pm.add_self_interaction(name)
+            hp.pm.write_file(hp.settings_path)  # overwrite: now carries virtual type
+            num_atom_types = len(hp.pm.types)  # == stack.total_types + 1
+            assert num_atom_types == stack.total_types + 1
+
         # Same key set as SheetOnSheetSimulation.write_inputs' base_context (only
         # the keys the template actually references), with hetero-specific values
         # and RUN-DIR-RELATIVE paths.
@@ -207,7 +276,8 @@ class HeteroSheetOnSheetSimulation(SimulationBase):
             "zhi": zhi,
             "data_file": "hetero.data",
             "potential_file": "lammps/system.in.settings",
-            "num_atom_types": stack.total_types,
+            "num_atom_types": num_atom_types,
+            "reserve_virtual_type": reserve_virtual_type,
             "ngroups": stack.total_types,
             "n_layers": n,
             "constraint_mode": "none",
