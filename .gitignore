@@ -11,3 +11,5 @@ settings.yaml
 .pytest_cache
 frictionsim2d-file-audit.md
 docs/
+AGENTS.md
+CLAUDE.md
